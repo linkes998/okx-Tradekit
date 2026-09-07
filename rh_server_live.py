@@ -28,6 +28,14 @@ from typing import Any
 from rh_trencher import Desk, TokenLaunch, scenario
 from rh_live_trader import LiveTrader, PendingSwap
 from rh_jupiter_executor import JupiterExecutor
+try:
+    from rh_okx_executor import OKXExecutor
+except ImportError:
+    OKXExecutor = None
+try:
+    from rh_okx_executor import OKXExecutor
+except ImportError:
+    OKXExecutor = None  # noqa: N816
 
 # ── Globals ──────────────────────────────────────────────────────
 _server: "ServerState | None" = None
@@ -68,6 +76,9 @@ class ServerState:
         self._sol_usd = sol_usd
         self._sol_price_fetched = False
 
+        self.executor_type = type(executor).__name__
+        self._feed_events: list[dict] = []
+        self._swaps_event = threading.Event()
         self.trader = LiveTrader(
             executor=executor,
             user_wallet=user_wallet,
@@ -86,8 +97,6 @@ class ServerState:
             realistic=True,
             signal_callback=self.trader.on_desk_fill,
         )
-        self._swaps_event = threading.Event()
-        self._feed_events: list[dict] = []
 
     def _log(self, msg: str) -> None:
         print(f"[LIVE_SERVER] {msg}")
@@ -1143,7 +1152,17 @@ def main(host: str = "127.0.0.1", port: int = 8765, csv_path: str | None = None,
     print(f"[LIVE_SERVER] Ticker map: {len(mint_map)} tokens")
     print(f"[LIVE_SERVER] CSV: {csv_file}")
 
-    ex = JupiterExecutor.from_env()
+    # Executor: RH_EXECUTOR=okx or jupiter (default: jupiter)
+    executor_mode = os.environ.get("RH_EXECUTOR", "jupiter").lower()
+    if executor_mode == "okx" and OKXExecutor is not None:
+        ex = OKXExecutor.from_env()
+        auth_str = "ready" if ex._auth_ready else "keys-not-set"
+        print(f"[LIVE_SERVER] Executor: OKX (auth={auth_str}, demo={ex.demo})")
+        bc = ex.ai_builder_code or "(not set - no commission tracking)"
+        print(f"[LIVE_SERVER] Builder Code: {bc}")
+    else:
+        ex = JupiterExecutor.from_env()
+        print("[LIVE_SERVER] Executor: Jupiter (Solana)")
 
     _server = ServerState(
         executor=ex,

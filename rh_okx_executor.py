@@ -35,7 +35,7 @@ ORD_TYPE_MARKET = "market"
 ORD_TYPE_LIMIT = "limit"
 
 # Trade mode: "spot" for spot, "cross"/"isolated" for derivatives
-TD_MODE_SPOT = "spot"
+TD_MODE_SPOT = "cash"    # OKX spot account (NOT "spot" — OKX Unified Account uses "cash" for spot)
 
 # ── Result dataclasses (aligned with JupiterExecutor interface) ───────
 @dataclass

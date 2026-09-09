@@ -55,13 +55,20 @@ class QuoteResult:
 
 @dataclass
 class OKXOrder:
-    """Built order payload — server-side signed via API key."""
+    """Built order payload — server-side signed via API key.
+
+    OKX spot market order rules:
+      BUY  → send tdSz (quote notional, e.g. "10" = spend 10 USDT)
+      SELL → send sz   (base qty, e.g. "0.000126" = sell 0.000126 BTC)
+    Limit orders always send sz + px.
+    """
     quote: QuoteResult
     inst_id: str
     side: str                     # "buy" / "sell"
     ord_type: str                 # "market" / "limit"
     td_mode: str                  # "spot" / "cross" / "isolated"
-    sz: str                       # quantity (base coin for buy, quote for market sell)
+    sz: str | None = None         # base asset quantity (sell + limit)
+    td_sz: str | None = None      # quote notional (market buy)
     px: str | None = None         # price (limit orders only)
     tag: str | None = None        # AI Builder Code for commission attribution
     cl_ord_id: str | None = None  # client order ID (optional)
@@ -327,28 +334,35 @@ class OKXExecutor:
     ) -> OKXOrder:
         """Translate quote into a signed OKX order payload.
 
-        Unlike Jupiter (which returns unsigned base64 tx for wallet signing),
-        OKX REST API signs server-side with your API key. So build_order
-        returns the order payload + signing info; submit_order broadcasts it.
+        OKX V5 spot market order rules:
+          BUY  → tdSz (quote notional, e.g. "10" USD)
+          SELL → sz   (base qty, e.g. "0.000126" BTC)
+        Limit orders: sz + px always.
         """
         use_tag = tag or self.ai_builder_code or None
-        sz = f"{quote.size_base:.6f}"
-        # Clean trailing zeros but keep at least 1 decimal
-        sz = sz.rstrip("0").rstrip(".")
-        if not sz:
-            sz = "0.000001"
 
-        return OKXOrder(
-            quote=quote,
-            inst_id=quote.inst_id,
-            side=quote.side,
-            ord_type=ord_type,
-            td_mode=td_mode,
-            sz=sz,
-            px=None,  # market order has no price
-            tag=use_tag,
-            cl_ord_id=cl_ord_id,
-        )
+        if ord_type == ORD_TYPE_MARKET and side == "buy":
+            # BUY: send quote notional — spend this many USDT
+            td_sz = f"{quote.size_usd:.2f}".rstrip("0").rstrip(".")
+            if not td_sz:
+                td_sz = "0.01"
+            return OKXOrder(
+                quote=quote, inst_id=quote.inst_id, side=side,
+                ord_type=ord_type, td_mode=td_mode,
+                sz=None, td_sz=td_sz, px=None,
+                tag=use_tag, cl_ord_id=cl_ord_id,
+            )
+        else:
+            # SELL (market) or LIMIT: send base asset quantity
+            sz = f"{quote.size_base:.6f}".rstrip("0").rstrip(".")
+            if not sz:
+                sz = "0.000001"
+            return OKXOrder(
+                quote=quote, inst_id=quote.inst_id, side=side,
+                ord_type=ord_type, td_mode=td_mode,
+                sz=sz, td_sz=None, px=None,
+                tag=use_tag, cl_ord_id=cl_ord_id,
+            )
 
     # ── Submit order (signed REST) ───────────────────────────────────
     def submit_order(self, order: OKXOrder) -> dict:
@@ -367,8 +381,11 @@ class OKXExecutor:
             "tdMode": order.td_mode,
             "side": order.side,
             "ordType": order.ord_type,
-            "sz": order.sz,
         }
+        if order.sz:
+            payload["sz"] = order.sz
+        if order.td_sz:
+            payload["tdSz"] = order.td_sz
         if order.px:
             payload["px"] = order.px
         if order.tag:

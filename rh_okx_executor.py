@@ -334,36 +334,20 @@ class OKXExecutor:
     ) -> OKXOrder:
         """Translate quote into a signed OKX order payload.
 
-        OKX V5 spot market order rules:
-          BUY  → tdSz (quote notional, e.g. "10" USD)
-          SELL → sz   (base qty, e.g. "0.000126" BTC)
-        Limit orders: sz + px always.
+        OKX V5 spot market orders use sz (base asset quantity) for BOTH
+        buy and sell — tdSz is NOT accepted for spot market orders.
         """
         use_tag = tag or self.ai_builder_code or None
-        side = quote.side  # "buy" / "sell" from quote
+        sz = f"{quote.size_base:.6f}".rstrip("0").rstrip(".")
+        if not sz:
+            sz = "0.000001"
 
-        if ord_type == ORD_TYPE_MARKET and side == "buy":
-            # BUY: send quote notional — spend this many USDT
-            td_sz = f"{quote.size_usd:.2f}".rstrip("0").rstrip(".")
-            if not td_sz:
-                td_sz = "0.01"
-            return OKXOrder(
-                quote=quote, inst_id=quote.inst_id, side=side,
-                ord_type=ord_type, td_mode=td_mode,
-                sz=None, td_sz=td_sz, px=None,
-                tag=use_tag, cl_ord_id=cl_ord_id,
-            )
-        else:
-            # SELL (market) or LIMIT: send base asset quantity
-            sz = f"{quote.size_base:.6f}".rstrip("0").rstrip(".")
-            if not sz:
-                sz = "0.000001"
-            return OKXOrder(
-                quote=quote, inst_id=quote.inst_id, side=side,
-                ord_type=ord_type, td_mode=td_mode,
-                sz=sz, td_sz=None, px=None,
-                tag=use_tag, cl_ord_id=cl_ord_id,
-            )
+        return OKXOrder(
+            quote=quote, inst_id=quote.inst_id, side=quote.side,
+            ord_type=ord_type, td_mode=td_mode,
+            sz=sz, td_sz=None, px=None,
+            tag=use_tag, cl_ord_id=cl_ord_id,
+        )
 
     # ── Submit order (signed REST) ───────────────────────────────────
     def submit_order(self, order: OKXOrder) -> dict:

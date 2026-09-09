@@ -340,6 +340,7 @@ class OKXExecutor:
         Limit orders: sz + px always.
         """
         use_tag = tag or self.ai_builder_code or None
+        side = quote.side  # "buy" / "sell" from quote
 
         if ord_type == ORD_TYPE_MARKET and side == "buy":
             # BUY: send quote notional — spend this many USDT

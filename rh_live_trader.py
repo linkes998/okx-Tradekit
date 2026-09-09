@@ -34,22 +34,27 @@ def _detect_platform(executor) -> str:
     return "unknown"
 
 
-# ── Default OKX spot instrument mapping ──────────────────────────────
+# ── Default OKX spot instrument mapping (ticker → instId) ──────────
+# Generated from OKX /api/v5/market/tickers (top 50 by 24h USDT volume)
+# Only tickers present here will be traded in OKX mode — unknown tickers
+# from DexScreener will be SKIPped to avoid 404 / connection errors.
 DEFAULT_OKX_INST_MAP: dict[str, str] = {
+    # Top volume
     "BTC": "BTC-USDT", "ETH": "ETH-USDT", "SOL": "SOL-USDT",
-    "BNB": "BNB-USDT", "XRP": "XRP-USDT", "ADA": "ADA-USDT",
-    "DOGE": "DOGE-USDT", "AVAX": "AVAX-USDT", "DOT": "DOT-USDT",
-    "MATIC": "MATIC-USDT", "LINK": "LINK-USDT", "LTC": "LTC-USDT",
-    "ARB": "ARB-USDT", "OP": "OP-USDT", "SUI": "SUI-USDT",
-    "APT": "APT-USDT", "SEI": "SEI-USDT", "TIA": "TIA-USDT",
-    "WIF": "WIF-USDT", "BONK": "BONK-USDT", "PEPE": "PEPE-USDT",
-    "SHIB": "SHIB-USDT", "FLOKI": "FLOKI-USDT", "MEME": "MEME-USDT",
-    "ORDI": "ORDI-USDT", "JUP": "JUP-USDT", "TURBO": "TURBO-USDT",
-    "JTO": "JTO-USDT", "MEW": "MEW-USDT", "GOAT": "GOAT-USDT",
-    "PYTH": "PYTH-USDT", "INJ": "INJ-USDT", "ATOM": "ATOM-USDT",
-    "ETC": "ETC-USDT", "NEAR": "NEAR-USDT", "AAVE": "AAVE-USDT",
-    "LDO": "LDO-USDT", "RPL": "RPL-USDT", "FIL": "FIL-USDT",
-    "CHZ": "CHZ-USDT", "THETA": "THETA-USDT", "ICP": "ICP-USDT",
+    "USDC": "USDC-USDT", "USDT": "USDT-TRY",
+    "XRP": "XRP-USDT", "DOGE": "DOGE-USDT", "BNB": "BNB-USDT",
+    "ADA": "ADA-USDT", "ARB": "ARB-USDT", "DOT": "DOT-USDT",
+    "SUI": "SUI-USDT", "TRX": "TRX-TRY", "NEAR": "NEAR-USDT",
+    # Mid volume
+    "UNI": "UNI-USDT", "LINK": "LINK-USDT", "LTC": "LTC-USDT",
+    "AVAX": "AVAX-USDT", "OP": "OP-USDT", "APT": "APT-USDT",
+    "SEI": "SEI-USDT", "TIA": "TIA-USDT", "WLD": "WLD-USDT",
+    "HYPE": "HYPE-USDT", "SOPH": "SOPH-USDT", "LIT": "LIT-USDT",
+    "MATIC": "MATIC-USDT", "PEPE": "PEPE-USDT", "SHIB": "SHIB-USDT",
+    # ETC + stable pairs
+    "ETC": "ETC-USDT", "AAVE": "AAVE-USDT", "FIL": "FIL-USDT",
+    "THETA": "THETA-USDT", "ICP": "ICP-USDT", "ATOM": "ATOM-USDT",
+    "LDO": "LDO-USDT", "RPL": "RPL-USDT", "CHZ": "CHZ-USDT",
 }
 
 SOL_LAMPORTS = 1_000_000_000
@@ -227,10 +232,16 @@ class LiveTrader:
     # ── Resolvers ──────────────────────────────────────────────────
 
     def _resolve_okx_inst(self, ticker: str) -> str | None:
+        """Return OKX instId only if ticker is explicitly mapped.
+
+        No fallback — unknown tickers (e.g. DexScreener memecoins not on
+        OKX) must return None so the caller SKIPs them instead of
+        constructing a fake `SOLFONE-USDT` that 404s.
+        """
         for t in (ticker, ticker.upper(), ticker.lower()):
             if t in self.ticker_inst_map:
                 return self.ticker_inst_map[t]
-        return f"{ticker.upper()}-USDT"
+        return None  # not on OKX — SKIP silently
 
     def _resolve_mint(self, ticker: str, resolve_mint_fn) -> str | None:
         for t in (ticker, ticker.upper(), ticker.lower()):

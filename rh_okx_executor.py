@@ -376,7 +376,11 @@ class OKXExecutor:
         if order.tag:
             payload["tag"] = order.tag
         if order.cl_ord_id:
-            payload["clOrdId"] = order.cl_ord_id
+            # OKX clOrdId: alphanumeric ONLY (no underscores, no hyphens).
+            # Strip any non-alphanumeric chars; if nothing left, omit it.
+            clean = "".join(c for c in order.cl_ord_id if c.isalnum())
+            if clean:
+                payload["clOrdId"] = clean[:32]  # max 32 chars per OKX spec
 
         resp = self._signed_post(OKX_V5 + "/trade/order", payload)
         result = self._check_ok(resp, "submit_order")

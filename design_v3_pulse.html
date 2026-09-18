@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RB2 Jupiter — Pulse</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=Work+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #faf8f5;
+  --card: #ffffff;
+  --border: #ece8e2;
+  --ink: #111111;
+  --ink-mid: #444;
+  --ink-dim: #999;
+  --clr-red: #e63946;
+  --clr-green: #0d6e3f;
+  --clr-purple: #7b2cbf;
+  --clr-orange: #f4845f;
+  --clr-blue: #0077b6;
+  --clr-black: #0a0a0a;
+  --radius: 2px;
+  --shadow: 0 1px 0 var(--border), 0 4px 20px rgba(0,0,0,0.04);
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: 'Work Sans', sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* ── HEADER ── */
+.header {
+  background: var(--clr-black);
+  color:#fff;
+  padding: 0;
+}
+.header-top {
+  display:flex; align-items:center; justify-content:space-between;
+  padding:16px 32px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+}
+.logo {
+  font-family:'Syne',sans-serif;
+  font-weight: 800;
+  font-size: 20px;
+  letter-spacing: -0.02em;
+}
+.logo em { color:var(--clr-orange); font-style:normal; }
+.logo span { color:rgba(255,255,255,0.4); font-weight:400; font-size:12px; margin-left:10px; font-family:'Work Sans',sans-serif; letter-spacing:0.05em; }
+.header-right {
+  display:flex; align-items:center; gap:20px;
+  font-size:11px;
+}
+.header-time {
+  font-family:'Syne',sans-serif;
+  font-weight:600;
+  font-size:13px;
+  color:rgba(255,255,255,0.6);
+}
+.live-badge {
+  display:flex; align-items:center; gap:6px;
+  font-family:'Syne',sans-serif;
+  font-weight:600;
+  font-size:10px;
+  text-transform:uppercase;
+  letter-spacing:0.15em;
+  color:var(--clr-green);
+  background:rgba(13,110,63,0.15);
+  padding:4px 10px;
+  border:1px solid rgba(13,110,63,0.3);
+}
+.live-badge::before {
+  content:'';
+  width:5px;height:5px;border-radius:50%;
+  background:var(--clr-green);
+  animation: blink 1.5s infinite;
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+
+.header-metrics {
+  display:grid;
+  grid-template-columns: repeat(5,1fr);
+}
+.h-metric {
+  padding:14px 24px;
+  border-right:1px solid rgba(255,255,255,0.06);
+  display:flex; flex-direction:column; gap:2px;
+}
+.h-metric:last-child { border-right:none; }
+.h-metric-label {
+  font-size:9px; text-transform:uppercase;
+  letter-spacing:0.15em; color:rgba(255,255,255,0.35);
+  font-weight:500;
+}
+.h-metric-val {
+  font-family:'Syne',sans-serif;
+  font-size:20px; font-weight:700;
+  letter-spacing:-0.02em;
+}
+.h-metric-val.green { color:var(--clr-green); }
+.h-metric-val.red { color:var(--clr-red); }
+.h-metric-val.orange { color:var(--clr-orange); }
+.h-metric-sub {
+  font-size:10px; color:rgba(255,255,255,0.3);
+}
+
+/* ── NAV BAR ── */
+.navbar {
+  background:#fff;
+  border-bottom:1px solid var(--border);
+  padding:0 32px;
+  display:flex; align-items:center; gap:0;
+}
+.nav-tab {
+  padding:12px 20px;
+  font-family:'Syne',sans-serif;
+  font-weight:600;
+  font-size:12px;
+  text-transform:uppercase;
+  letter-spacing:0.08em;
+  color:var(--ink-dim);
+  border-bottom:2px solid transparent;
+  cursor:pointer;
+  transition:all 0.15s;
+}
+.nav-tab:hover { color:var(--ink); }
+.nav-tab.active {
+  color:var(--ink);
+  border-bottom-color:var(--clr-black);
+}
+.nav-tab .count {
+  display:inline-flex;
+  align-items:center; justify-content:center;
+  width:16px; height:16px;
+  background:var(--clr-black);
+  color:#fff;
+  font-size:9px;
+  border-radius:0;
+  margin-left:6px;
+  font-family:'Work Sans',sans-serif;
+}
+
+/* ── MAIN GRID ── */
+.content {
+  padding:24px 32px;
+  max-width:1400px;
+}
+
+/* Hero large number */
+.hero-row {
+  display:grid;
+  grid-template-columns: 1fr 1fr 320px;
+  gap:1px;
+  background:var(--border);
+  border:1px solid var(--border);
+  margin-bottom:20px;
+}
+.hero-col {
+  background:#fff;
+  padding:28px 32px;
+  display:flex; flex-direction:column; gap:4px;
+}
+.hero-big {
+  font-family:'Syne',sans-serif;
+  font-size:52px;
+  font-weight:800;
+  letter-spacing:-0.03em;
+  line-height:1;
+}
+.hero-big.green { color:var(--clr-green); }
+.hero-label {
+  font-size:10px;
+  text-transform:uppercase;
+  letter-spacing:0.18em;
+  color:var(--ink-dim);
+  font-weight:600;
+}
+.hero-sub {
+  font-size:12px;
+  color:var(--ink-mid);
+}
+.hero-tag {
+  display:inline-flex;
+  align-items:center;
+  font-family:'Syne',sans-serif;
+  font-weight:700;
+  font-size:10px;
+  text-transform:uppercase;
+  letter-spacing:0.1em;
+  padding:4px 10px;
+  margin-top:8px;
+  width:fit-content;
+}
+.hero-tag.green { background:rgba(13,110,63,0.1); color:var(--clr-green); }
+.hero-tag.orange { background:rgba(244,132,95,0.1); color:var(--clr-orange); }
+.hero-tag.purple { background:rgba(123,44,191,0.1); color:var(--clr-purple); }
+
+/* ── Panels ── */
+.panels {
+  display:grid;
+  grid-template-columns: 1fr 1fr;
+  gap:1px;
+  background:var(--border);
+  border:1px solid var(--border);
+  margin-bottom:20px;
+}
+.panel {
+  background:#fff;
+  padding:0;
+}
+.panel-header {
+  padding:16px 24px;
+  border-bottom:1px solid var(--border);
+  display:flex; align-items:center; justify-content:space-between;
+}
+.panel-title {
+  font-family:'Syne',sans-serif;
+  font-weight:700;
+  font-size:11px;
+  text-transform:uppercase;
+  letter-spacing:0.14em;
+  color:var(--ink);
+}
+.panel-action {
+  font-size:10px;
+  text-transform:uppercase;
+  letter-spacing:0.1em;
+  color:var(--ink-dim);
+  cursor:pointer;
+  font-weight:500;
+}
+.panel-action:hover { color:var(--clr-black); }
+.panel-body { padding:16px 24px; }
+
+/* Chart */
+.chart-box {
+  height:200px;
+  position:relative;
+}
+.chart-box canvas { width:100%; height:100%; }
+
+/* Position rows */
+.pos-row {
+  display:grid;
+  grid-template-columns:1fr auto auto auto auto;
+  align-items:center;
+  gap:16px;
+  padding:10px 0;
+  border-bottom:1px solid var(--border);
+}
+.pos-row:last-child { border-bottom:none; }
+.pos-ticker {
+  font-family:'Syne',sans-serif;
+  font-weight:700;
+  font-size:14px;
+  letter-spacing:-0.01em;
+}
+.pos-sub { font-size:10px; color:var(--ink-dim); margin-top:1px; }
+.pos-pnl { font-family:'Syne',sans-serif; font-weight:700; font-size:15px; }
+.pos-pnl.green { color:var(--clr-green); }
+.pos-pnl.red { color:var(--clr-red); }
+
+/* Tag styles */
+.tag {
+  display:inline-block;
+  font-size:9px;
+  font-weight:600;
+  text-transform:uppercase;
+  letter-spacing:0.08em;
+  padding:3px 8px;
+}
+.tag-long { background:rgba(13,110,63,0.1); color:var(--clr-green); }
+.tag-short { background:rgba(230,57,70,0.1); color:var(--clr-red); }
+.tag-okx { background:rgba(0,119,182,0.1); color:var(--clr-blue); }
+.tag-jup { background:rgba(123,44,191,0.1); color:var(--clr-purple); }
+
+/* ── Decision feed ── */
+.dec-feed { display:flex; flex-direction:column; gap:1px; }
+.dec-item {
+  display:grid;
+  grid-template-columns:36px 1fr auto;
+  gap:12px;
+  align-items:start;
+  padding:12px 0;
+  border-bottom:1px solid var(--border);
+}
+.dec-item:last-child { border-bottom:none; }
+.dec-icon {
+  width:36px; height:36px;
+  display:flex; align-items:center; justify-content:center;
+  font-family:'Syne',sans-serif;
+  font-weight:800;
+  font-size:16px;
+}
+.dec-icon.buy { background:rgba(13,110,63,0.1); color:var(--clr-green); }
+.dec-icon.sell { background:rgba(230,57,70,0.1); color:var(--clr-red); }
+.dec-info {}
+.dec-top { display:flex; align-items:center; gap:8px; margin-bottom:2px; }
+.dec-ticker { font-family:'Syne',sans-serif; font-weight:700; font-size:13px; }
+.dec-desc { font-size:11px; color:var(--ink-dim); line-height:1.4; }
+.dec-meta { font-size:10px; color:var(--ink-dim); margin-top:4px; display:flex; gap:12px; }
+.dec-amount {
+  text-align:right;
+  font-family:'Syne',sans-serif;
+}
+.dec-amount-val { font-size:16px; font-weight:700; }
+.dec-amount-sub { font-size:10px; color:var(--ink-dim); }
+
+/* ── Kelly section ── */
+.kelly-grid {
+  display:grid; grid-template-columns:1fr 1fr; gap:16px;
+}
+.kelly-item {}
+.kelly-key {
+  font-size:9px; text-transform:uppercase; letter-spacing:0.14em;
+  color:var(--ink-dim); font-weight:600; margin-bottom:4px;
+}
+.kelly-val {
+  font-family:'Syne',sans-serif;
+  font-size:28px; font-weight:700; letter-spacing:-0.02em;
+}
+.kelly-val.green { color:var(--clr-green); }
+.kelly-val.red { color:var(--clr-red); }
+.kelly-val.orange { color:var(--clr-orange); }
+.kelly-val.purple { color:var(--clr-purple); }
+.kelly-sub { font-size:10px; color:var(--ink-dim); margin-top:2px; }
+.kelly-track {
+  height:3px; background:var(--border); margin-top:8px;
+}
+.kelly-fill {
+  height:100%; background:var(--clr-black);
+}
+
+/* ── Bottom row ── */
+.bottom-row {
+  display:grid;
+  grid-template-columns:1fr 1fr 1fr;
+  gap:1px;
+  background:var(--border);
+  border:1px solid var(--border);
+}
+.bottom-panel { background:#fff; }
+.bottom-panel .panel-header { padding:14px 20px; }
+.bottom-panel .panel-body { padding:12px 20px 16px; }
+
+.mini-row {
+  display:flex; justify-content:space-between; align-items:center;
+  padding:7px 0;
+  border-bottom:1px solid var(--border);
+  font-size:11px;
+}
+.mini-row:last-child { border-bottom:none; }
+.mini-label { color:var(--ink-dim); }
+.mini-val { font-weight:600; font-family:'Syne',sans-serif; }
+
+/* ── Animations ── */
+@keyframes slideIn {
+  from { opacity:0; transform:translateY(8px); }
+  to { opacity:1; transform:translateY(0); }
+}
+.hero-col, .panel, .bottom-panel {
+  animation: slideIn 0.4s ease both;
+}
+.hero-col:nth-child(2) { animation-delay:0.05s; }
+.hero-col:nth-child(3) { animation-delay:0.1s; }
+.panel:nth-child(2) { animation-delay:0.08s; }
+
+@media(max-width:1000px) {
+  .hero-row { grid-template-columns:1fr; }
+  .panels { grid-template-columns:1fr; }
+  .bottom-row { grid-template-columns:1fr; }
+  .header-metrics { grid-template-columns:repeat(3,1fr); }
+}
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="header">
+  <div class="header-top">
+    <div class="logo">RB2 <em>JUPITER</em><span>Trading Engine v2.4</span></div>
+    <div class="header-right">
+      <div class="header-time">14:32:11 UTC</div>
+      <div class="live-badge">Live · Demo</div>
+    </div>
+  </div>
+  <div class="header-metrics">
+    <div class="h-metric">
+      <div class="h-metric-label">Bankroll</div>
+      <div class="h-metric-val">$128,492</div>
+      <div class="h-metric-sub">Start $100,000 · +28.5%</div>
+    </div>
+    <div class="h-metric">
+      <div class="h-metric-label">24h PnL</div>
+      <div class="h-metric-val green">+$4,218</div>
+      <div class="h-metric-sub">+3.40% · 12W / 7L</div>
+    </div>
+    <div class="h-metric">
+      <div class="h-metric-label">Open Trades</div>
+      <div class="h-metric-val orange">3</div>
+      <div class="h-metric-sub">Notional $8,420</div>
+    </div>
+    <div class="h-metric">
+      <div class="h-metric-label">Win Rate</div>
+      <div class="h-metric-val green">62.3%</div>
+      <div class="h-metric-sub">147 trades closed</div>
+    </div>
+    <div class="h-metric">
+      <div class="h-metric-label">Kelly Sizing</div>
+      <div class="h-metric-val">0.085</div>
+      <div class="h-metric-sub">ATR penalty 0.300</div>
+    </div>
+  </div>
+</div>
+
+<!-- NAV -->
+<div class="navbar">
+  <div class="nav-tab active">Dashboard</div>
+  <div class="nav-tab">Positions <span class="count">3</span></div>
+  <div class="nav-tab">Trade History</div>
+  <div class="nav-tab">Kelly Analysis</div>
+  <div class="nav-tab">Builder Code</div>
+  <div class="nav-tab">Settings</div>
+</div>
+
+<!-- CONTENT -->
+<div class="content">
+
+  <!-- Hero Row -->
+  <div class="hero-row">
+    <div class="hero-col">
+      <div class="hero-label">Total Equity</div>
+      <div class="hero-big green">$128,492</div>
+      <div class="hero-sub">Up $28,492 from starting capital</div>
+      <div class="hero-tag green">▲ All-time high: $134,201</div>
+    </div>
+    <div class="hero-col">
+      <div class="hero-label">Today's Activity</div>
+      <div class="hero-big">18</div>
+      <div class="hero-sub">Trades executed · $142K volume</div>
+      <div style="display:flex;gap:8px;margin-top:4px">
+        <div class="hero-tag green">12 Wins</div>
+        <div class="hero-tag orange">7 Losses</div>
+        <div class="hero-tag purple">Kelly: 0.085</div>
+      </div>
+    </div>
+    <div class="hero-col" style="justify-content:center;padding:28px 32px">
+      <div class="hero-label" style="margin-bottom:12px">Platform Status</div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px">
+          <span style="color:var(--ink-mid)">OKX Spot</span>
+          <span style="font-weight:700;color:var(--clr-green);font-family:'Syne',sans-serif;font-size:11px">● Connected</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px">
+          <span style="color:var(--ink-mid)">OKX Perp</span>
+          <span style="font-weight:700;color:var(--clr-green);font-family:'Syne',sans-serif;font-size:11px">● Connected</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px">
+          <span style="color:var(--ink-mid)">Jupiter Swap</span>
+          <span style="font-weight:700;color:var(--clr-purple);font-family:'Syne',sans-serif;font-size:11px">● Server Sign</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px">
+          <span style="color:var(--ink-mid)">Mode</span>
+          <span style="font-weight:700;color:var(--clr-orange);font-family:'Syne',sans-serif;font-size:11px">DEMO</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Panels Row -->
+  <div class="panels">
+    <!-- Equity Chart -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">Equity Curve</div>
+        <div style="display:flex;gap:12px;font-size:10px;color:var(--ink-dim)">
+          <span style="cursor:pointer;color:var(--clr-black);font-weight:600">1D</span>
+          <span style="cursor:pointer">1W</span>
+          <span style="cursor:pointer">ALL</span>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="chart-box"><canvas id="eqChart"></canvas></div>
+      </div>
+    </div>
+
+    <!-- Positions -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">Open Positions</div>
+        <div class="panel-action">View all →</div>
+      </div>
+      <div class="panel-body" style="padding:8px 24px">
+        <div class="pos-row">
+          <div>
+            <div class="pos-ticker">WIF/USDT</div>
+            <div class="pos-sub">OKX Spot · Long</div>
+          </div>
+          <div style="text-align:right;font-size:11px;color:var(--ink-dim)">
+            <div>Entry: $1.842</div>
+            <div style="font-family:'Syne',sans-serif;font-weight:700;color:var(--ink)">Mark: $1.901</div>
+          </div>
+          <div class="pos-pnl green" style="text-align:right">+$234</div>
+          <div style="text-align:right;font-family:'Syne',sans-serif;font-weight:700;color:var(--clr-green);font-size:13px">1.03x</div>
+          <span class="tag tag-okx">OKX</span>
+        </div>
+        <div class="pos-row">
+          <div>
+            <div class="pos-ticker">PEPE/USDT</div>
+            <div class="pos-sub">Jupiter · Long</div>
+          </div>
+          <div style="text-align:right;font-size:11px;color:var(--ink-dim)">
+            <div>Entry: $0.00721</div>
+            <div style="font-family:'Syne',sans-serif;font-weight:700;color:var(--ink)">Mark: $0.00718</div>
+          </div>
+          <div class="pos-pnl red" style="text-align:right">-$52</div>
+          <div style="text-align:right;font-family:'Syne',sans-serif;font-weight:700;color:var(--clr-red);font-size:13px">0.99x</div>
+          <span class="tag tag-jup">JUP</span>
+        </div>
+        <div class="pos-row">
+          <div>
+            <div class="pos-ticker">DOGE/USDT</div>
+            <div class="pos-sub">OKX Spot · Short</div>
+          </div>
+          <div style="text-align:right;font-size:11px;color:var(--ink-dim)">
+            <div>Entry: $0.1842</div>
+            <div style="font-family:'Syne',sans-serif;font-weight:700;color:var(--ink)">Mark: $0.1819</div>
+          </div>
+          <div class="pos-pnl green" style="text-align:right">+$118</div>
+          <div style="text-align:right;font-family:'Syne',sans-serif;font-weight:700;color:var(--clr-green);font-size:13px">1.01x</div>
+          <span class="tag tag-okx">OKX</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Decisions + Kelly -->
+  <div class="panels">
+    <!-- AI Decisions -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">AI Decisions</div>
+        <div class="panel-action">Log →</div>
+      </div>
+      <div class="panel-body" style="padding:8px 24px">
+        <div class="dec-feed">
+          <div class="dec-item">
+            <div class="dec-icon buy">↑</div>
+            <div class="dec-info">
+              <div class="dec-top">
+                <span class="dec-ticker">PEPE/USDT</span>
+                <span class="tag tag-okx">SPOT BUY</span>
+              </div>
+              <div class="dec-desc">Narrative strong · holder cluster detected · liq growth accelerating</div>
+              <div class="dec-meta"><span>Size: 1.87% bankroll</span><span>Kelly: 0.085</span><span>14:32 UTC</span></div>
+            </div>
+            <div class="dec-amount">
+              <div class="dec-amount-val" style="color:var(--clr-green)">$2,400</div>
+              <div class="dec-amount-sub">Position size</div>
+            </div>
+          </div>
+          <div class="dec-item">
+            <div class="dec-icon sell">↓</div>
+            <div class="dec-info">
+              <div class="dec-top">
+                <span class="dec-ticker">BONK/USDT</span>
+                <span class="tag" style="background:rgba(13,110,63,0.1);color:var(--clr-green)">TAKE PROFIT</span>
+              </div>
+              <div class="dec-desc">Target 2.0x reached · trailing stop active</div>
+              <div class="dec-meta"><span>PnL: +$810</span><span>Mult: 2.14x</span><span>14:28 UTC</span></div>
+            </div>
+            <div class="dec-amount">
+              <div class="dec-amount-val" style="color:var(--clr-green)">+$810</div>
+              <div class="dec-amount-sub">Realized</div>
+            </div>
+          </div>
+          <div class="dec-item">
+            <div class="dec-icon sell" style="background:rgba(230,57,70,0.1);color:var(--clr-red)">↓</div>
+            <div class="dec-info">
+              <div class="dec-top">
+                <span class="dec-ticker">SHIB/USDT</span>
+                <span class="tag" style="background:rgba(230,57,70,0.1);color:var(--clr-red)">STOP LOSS</span>
+              </div>
+              <div class="dec-desc">Mult dropped to 0.87x · ATR trigger activated</div>
+              <div class="dec-meta"><span>PnL: -$117</span><span>Mult: 0.87x</span><span>13:58 UTC</span></div>
+            </div>
+            <div class="dec-amount">
+              <div class="dec-amount-val" style="color:var(--clr-red)">-$117</div>
+              <div class="dec-amount-sub">Realized</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Kelly -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">Kelly Criterion</div>
+        <div class="panel-action">Details →</div>
+      </div>
+      <div class="panel-body">
+        <div class="kelly-grid">
+          <div class="kelly-item">
+            <div class="kelly-key">Win Rate</div>
+            <div class="kelly-val green">62%</div>
+            <div class="kelly-sub">Raw · Decayed: 58%</div>
+            <div class="kelly-track"><div class="kelly-fill" style="width:62%;background:var(--clr-green)"></div></div>
+          </div>
+          <div class="kelly-item">
+            <div class="kelly-key">Kelly Fraction</div>
+            <div class="kelly-val">0.085</div>
+            <div class="kelly-sub">Full: 0.247 · Capped: 0.150</div>
+            <div class="kelly-track"><div class="kelly-fill" style="width:56%;background:var(--clr-orange)"></div></div>
+          </div>
+          <div class="kelly-item">
+            <div class="kelly-key">Expectancy</div>
+            <div class="kelly-val green">+0.89</div>
+            <div class="kelly-sub">Per trade average</div>
+          </div>
+          <div class="kelly-item">
+            <div class="kelly-key">ATR Penalty</div>
+            <div class="kelly-val orange">0.30</div>
+            <div class="kelly-sub">Vol = 8.2% · Aggressive mode</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bottom Row -->
+  <div class="bottom-row">
+    <div class="bottom-panel">
+      <div class="panel-header">
+        <div class="panel-title">Builder Code</div>
+      </div>
+      <div class="panel-body">
+        <div class="mini-row"><span class="mini-label">Code</span><span class="mini-val" style="font-family:monospace;color:var(--clr-orange)">RB2-JUPITER</span></div>
+        <div class="mini-row"><span class="mini-label">Commission returned</span><span class="mini-val" style="color:var(--clr-green)">+$128.40</span></div>
+        <div class="mini-row"><span class="mini-label">Today</span><span class="mini-val" style="color:var(--clr-green)">+$18.20</span></div>
+        <div class="mini-row"><span class="mini-label">Attributed trades</span><span class="mini-val">47</span></div>
+        <div class="mini-row"><span class="mini-label">Attrition rate</span><span class="mini-val" style="color:var(--clr-green)">100%</span></div>
+      </div>
+    </div>
+    <div class="bottom-panel">
+      <div class="panel-header">
+        <div class="panel-title">Recent Trades</div>
+        <div class="panel-action">Export →</div>
+      </div>
+      <div class="panel-body">
+        <div class="mini-row"><span class="mini-label">BONK — Sold (TP)</span><span class="mini-val" style="color:var(--clr-green)">+$810</span></div>
+        <div class="mini-row"><span class="mini-label">FLOKI — Sold (Time)</span><span class="mini-val" style="color:var(--clr-green)">+$294</span></div>
+        <div class="mini-row"><span class="mini-label">SHIB — Sold (SL)</span><span class="mini-val" style="color:var(--clr-red)">-$117</span></div>
+        <div class="mini-row"><span class="mini-label">SOL — Sold (TP)</span><span class="mini-val" style="color:var(--clr-green)">+$1,204</span></div>
+        <div class="mini-row"><span class="mini-label">LINK — Sold (TP)</span><span class="mini-val" style="color:var(--clr-green)">+$432</span></div>
+      </div>
+    </div>
+    <div class="bottom-panel">
+      <div class="panel-header">
+        <div class="panel-title">System</div>
+      </div>
+      <div class="panel-body">
+        <div class="mini-row"><span class="mini-label">Uptime</span><span class="mini-val">14d 7h</span></div>
+        <div class="mini-row"><span class="mini-label">API calls/min</span><span class="mini-val">24</span></div>
+        <div class="mini-row"><span class="mini-label">Rate limit</span><span class="mini-val" style="color:var(--clr-green)">2,471 left</span></div>
+        <div class="mini-row"><span class="mini-label">Risk preference</span><span class="mini-val">Balanced</span></div>
+        <div class="mini-row"><span class="mini-label">Trade mode</span><span class="mini-val" style="color:var(--clr-blue)">Auto</span></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ── Equity Chart ──
+const canvas = document.getElementById('eqChart');
+const ctx = canvas.getContext('2d');
+
+function resize() {
+  const rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width = rect.width * 2;
+  canvas.height = rect.height * 2;
+  ctx.scale(2, 2);
+  canvas.style.width = rect.width + 'px';
+  canvas.style.height = rect.height + 'px';
+}
+resize();
+window.addEventListener('resize', () => { resize(); draw(); });
+
+function generateData(n, start, vol) {
+  const d = [start];
+  for (let i = 1; i < n; i++) {
+    const shock = (Math.random() - 0.47) * vol;
+    d.push(d[i-1] * (1 + 0.0003 + shock));
+  }
+  return d;
+}
+
+const equity = generateData(120, 100000, 0.009);
+const peak = Math.max(...equity);
+const trough = Math.min(...equity);
+const lastVal = equity[equity.length - 1];
+const color = lastVal >= equity[0] ? '#0d6e3f' : '#e63946';
+
+function draw() {
+  const W = parseFloat(canvas.style.width);
+  const H = parseFloat(canvas.style.height);
+  ctx.clearRect(0, 0, W, H);
+
+  const pad = { t:12, b:12, l:0, r:0 };
+  const cw = W, ch = H - pad.t - pad.b;
+  const range = peak - trough || 1;
+
+  function pt(i) {
+    return {
+      x: (i / (equity.length - 1)) * cw,
+      y: pad.t + (1 - (equity[i] - trough) / range) * ch
+    };
+  }
+
+  // Area
+  const grad = ctx.createLinearGradient(0, pad.t, 0, H);
+  grad.addColorStop(0, color.replace(')', ',0.1)').replace('rgb', 'rgba'));
+  if (color.startsWith('#')) {
+    const r = parseInt(color.slice(1,3),16), g = parseInt(color.slice(3,5),16), b = parseInt(color.slice(5,7),16);
+    grad.addColorStop(0, `rgba(${r},${g},${b},0.1)`);
+    grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
+  }
+  ctx.beginPath();
+  ctx.moveTo(0, H - pad.b);
+  for (let i = 0; i < equity.length; i++) {
+    const p = pt(i);
+    ctx.lineTo(p.x, p.y);
+  }
+  ctx.lineTo(cw, H - pad.b);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Line
+  ctx.beginPath();
+  for (let i = 0; i < equity.length; i++) {
+    const p = pt(i);
+    i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y);
+  }
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // End dot
+  const ep = pt(equity.length - 1);
+  ctx.beginPath(); ctx.arc(ep.x, ep.y, 4, 0, Math.PI*2);
+  ctx.fillStyle = color; ctx.fill();
+  ctx.beginPath(); ctx.arc(ep.x, ep.y, 8, 0, Math.PI*2);
+  ctx.strokeStyle = color.replace(')', ',0.2)').replace('rgb','rgba').replace('#','rgba(').slice(0,-1);
+  // simple glow
+  ctx.globalAlpha = 0.2;
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // Label
+  ctx.fillStyle = '#111';
+  ctx.font = '600 11px "Syne", sans-serif';
+  ctx.textAlign = 'right';
+  ctx.fillText('$' + lastVal.toLocaleString(undefined,{maximumFractionDigits:0}), cw - 10, ep.y - 10);
+}
+draw();
+</script>
+</body>
+</html>

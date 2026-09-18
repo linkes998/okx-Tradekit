@@ -1,4 +1,4 @@
-# ── Secrets & credentials ──────────────────────────────
+# ── Secrets & credentials ──────────────────────────────────
 .env
 .env.local
 .env.staging
@@ -12,6 +12,8 @@ __pycache__/
 dist/
 build/
 .eggs/
+*.venv/
+venv/
 
 # ── IDE ────────────────────────────────────────────────
 .idea/
@@ -21,17 +23,50 @@ build/
 *.sublime-project
 
 # ── Runtime data (generated, non-deterministic) ────────
+data/
+*.db
+*.db-shm
+*.db-wal
+trades.db
+trades.db-shm
+trades.db-wal
 pool_lake.db
 reports/pool_lake_*.csv
 reports/report_*.json
-test_sse.py
-.env - 副本.example
+
+# ── Logs ────────────────────────────────────────────────
+*.log
+*.txt.log
+server_log.txt
+server_err.txt
+logs/
+
+# ── Screenshots / temp files ───────────────────────────
+screenshot_*.png
+stress_test_results.json
+
+# ── Test / debug scripts (dev-only, not for production) ─
+test_*.py
+check_*.py
+_check_monitor.py
+patch_server.py
+synthesise_500.py
+daily_pipeline.py
+fetch_dexscreener.py
+fetch_dex_top.py
+fetch_gt_pipeline.py
+fetch_gt_trending.py
+enrich_holders.py
+enrich_ohlcv.py
+
+# ── Data / reports (generated artifacts) ───────────────
+reports/
 
 # ── OS ─────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# ── Logs ───────────────────────────────────────────────
-*.log
-logs/
+# ── Misc ────────────────────────────────────────────────
+.env - 副本.example
+.env.example

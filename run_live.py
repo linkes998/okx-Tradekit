@@ -28,7 +28,7 @@ from pathlib import Path
 
 import rh_monitor
 import rh_poll
-import rh_server
+import rh_server_live as rh_server
 import rh_trencher
 
 
@@ -200,7 +200,7 @@ def main():
         signal.signal(signal.SIGINT, _sigint_handler)
 
         try:
-            rh_server.main(args.host, args.port, live_mode=True)
+            rh_server.main(args.host, args.port, no_live_runner=False)
         except KeyboardInterrupt:
             _shutdown_live(fx, engine)
         return

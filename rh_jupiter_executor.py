@@ -21,6 +21,13 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+try:
+    import nacl.encoding
+    import nacl.signing
+    _HAS_NACL = True
+except ImportError:
+    _HAS_NACL = False
+
 # Constants --------------------------------------------------------
 JUPITER_QUOTE_URL = "https://api.jup.ag/swap/v1/quote"
 JUPITER_SWAP_URL = "https://api.jup.ag/swap/v1/swap"
@@ -199,6 +206,24 @@ class JupiterExecutor:
         if self.api_key:
             self._headers["x-api-key"] = self.api_key
 
+        # Server-side signing key — optional; if set, auto-signs transactions
+        # env: RH_JUPITER_PRIVATE_KEY (base58-encoded ed25519 secret key, 64 bytes)
+        _priv_env = os.environ.get("RH_JUPITER_PRIVATE_KEY", "")
+        self._signing_key = None
+        if _priv_env and _HAS_NACL:
+            try:
+                raw_key = base58_decode(_priv_env)
+                if len(raw_key) == 64:
+                    self._signing_key = nacl.signing.SigningKey(raw_key)
+            except Exception as e:
+                print(f"[JupiterExecutor] WARNING: invalid RH_JUPITER_PRIVATE_KEY: {e}")
+        elif _priv_env and not _HAS_NACL:
+            print("[JupiterExecutor] WARNING: RH_JUPITER_PRIVATE_KEY set but nacl not installed")
+
+    @property
+    def server_signing_ready(self) -> bool:
+        return self._signing_key is not None
+
     @classmethod
     def from_env(cls):
         api_key = os.environ.get("JUPITER_API_KEY")
@@ -370,6 +395,47 @@ class JupiterExecutor:
             user_public_key=user_public_key,
             request_id=resp.get("requestId"),
         )
+
+    def sign_transaction(self, transaction_base64: str) -> str:
+        """Server-side ed25519 sign a Jupiter swap transaction (base64).
+        Returns the signed base64 string ready for sendTransaction RPC.
+        Raises RuntimeError if no signing key configured.
+        """
+        if not self._signing_key:
+            raise RuntimeError(
+                "No server-side signing key configured. "
+                "Set RH_JUPITER_PRIVATE_KEY env var (base58 ed25519 secret key)."
+            )
+        import base64 as _b64
+        raw = _b64.b64decode(transaction_base64)
+        signed = self._signing_key.sign(raw)
+        return _b64.b64encode(signed).decode("ascii")
+
+    def submit_server_signed(self, bundle: "SwapBundle") -> dict:
+        """Build + sign + submit in one call (server-side signing path).
+        Returns dict with 'ok', 'sig' on success or 'error' on failure.
+        """
+        signed_tx = self.sign_transaction(bundle.transaction_base64)
+        return self._send_transaction(signed_tx, bundle.user_public_key)
+
+    def _send_transaction(self, tx_base64: str, user_pubkey: str) -> dict:
+        """POST sendTransaction to the configured RPC URL."""
+        import urllib.request as _ur
+        try:
+            payload = json.dumps({
+                "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
+                "params": [tx_base64, {"encoding": "base64", "preflightCommitment": "confirmed"}],
+            }).encode("utf-8")
+            rpc_url = os.environ.get("RH_SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+            req = _ur.Request(rpc_url, data=payload, headers={"Content-Type": "application/json"})
+            with _ur.urlopen(req, timeout=30) as resp:
+                rpc_result = json.loads(resp.read())
+            if "result" not in rpc_result:
+                err = rpc_result.get("error", {}).get("message", str(rpc_result))
+                return {"ok": False, "error": str(err), "platform": "jupiter"}
+            return {"ok": True, "sig": rpc_result["result"], "platform": "jupiter"}
+        except Exception as e:
+            return {"ok": False, "error": str(e), "platform": "jupiter"}
 
     def estimate_buy(self, ticker_or_mint, sol_amount_lamports, user_public_key=None):
         quote = self.get_quote(

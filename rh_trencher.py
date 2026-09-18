@@ -1,14 +1,14 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Robinhood Chain Grok Trencher — paper simulation. No keys, no live orders."""
 from __future__ import annotations
 
 import hashlib
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
 
-import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -269,39 +269,105 @@ class WalletMap:
 
 
 class Sizer:
-    def __init__(self, bankroll_usd: float, f_cap: float = 0.15, fraction: float = 0.35):
+    """Kelly position sizer with adaptive win-rate decay and volatility penalty.
+
+    The raw Kelly fraction f = p/L - q/W assumes stationary win rate.
+    In practice, recent performance matters more — we exponentially decay
+    old results with a configurable half-life so the sizing reacts to
+    regime changes (win streaks / drawdowns).
+
+    Volatility penalty: high ATR% of the instrument means wider stochastic
+    swings, so we reduce f proportionally to dampen position size in
+    choppy markets (simulates a volatility-scaled Kelly).
+    """
+
+    def __init__(self, bankroll_usd: float, f_cap: float = 0.15, fraction: float = 0.35,
+                 half_life_trades: int = 10):
         self.bankroll = bankroll_usd
         self.f_cap = f_cap
         self.fraction = fraction
-        self.history: list[float] = []
+        self.half_life = half_life_trades  # half-life in trade-count for exponential decay
+        self.history: list[float] = []      # r-multiples, ordered oldest → newest
+        self.trade_ts: list[float] = []     # monotonic timestamps per trade (for wall-clock decay)
+        self.atr_pct: float = 0.0           # external: set via set_atr_pct() before kelly() call
 
-    def record(self, r_multiple: float) -> None:
+    def set_atr_pct(self, atr_pct: float) -> None:
+        """Call before kelly() to inject current ATR-based vol estimate (e.g. 0.02 = 2%)."""
+        self.atr_pct = max(0.0, float(atr_pct))
+
+    def record(self, r_multiple: float, wall_ts: float | None = None) -> None:
         self.history.append(r_multiple)
+        import time as _time
+        self.trade_ts.append(wall_ts if wall_ts is not None else _time.monotonic())
+
+    def _decayed_p(self) -> float:
+        """Exponentially-decayed win rate. Recent trades weighted heavier."""
+        n = len(self.history)
+        if n == 0:
+            return 0.35
+        weights = []
+        last_ts = self.trade_ts[-1] if self.trade_ts else 0
+        for i, ts in enumerate(self.trade_ts):
+            lag = last_ts - ts
+            # half-life in seconds ≈ (n / mean_trade_gap). Use wall-clock when available.
+            # Fallback: index-based decay when no wall-ts
+            if last_ts > 0 and lag > 0:
+                w = 0.5 ** (lag / (self.half_life * max(1, (last_ts - self.trade_ts[0]) / max(1, n - 1))))
+            else:
+                w = 0.5 ** ((n - 1 - i) / max(1, self.half_life))
+            weights.append(w)
+        h = np.array(self.history)
+        w = np.array(weights)
+        # Weighted win rate
+        weighted_r = h * w
+        total_w = w.sum()
+        if total_w == 0:
+            return 0.35
+        avg_r = float(weighted_r.sum() / total_w)
+        # Convert avg R to implied p using median W/L from empirical
+        stats = self.empirical()
+        W = stats["W"] if stats["W"] > 0 else 2.0
+        L = stats["L"] if stats["L"] > 0 else 0.45
+        # E[R] = p*W - (1-p)*L  →  p = (E[R] + L) / (W + L)
+        p = (avg_r + L) / (W + L)
+        return max(0.05, min(0.95, p))
 
     def empirical(self) -> dict:
         if not self.history:
             return {"p": 0.35, "W": 2.0, "L": 0.45, "n": 0, "expectancy": 0.0}
         h = np.array(self.history)
         wins, losses = h[h > 0], np.abs(h[h <= 0])
-        p = len(wins) / len(h)
+        p_raw = len(wins) / len(h)
         W = float(wins.mean()) if len(wins) else 2.0
         L = float(losses.mean()) if len(losses) else 0.45
-        return {"p": p, "W": W, "L": L, "n": len(h), "expectancy": p * W - (1 - p) * L}
+        return {"p": p_raw, "W": W, "L": L, "n": len(h), "expectancy": p_raw * W - (1 - p_raw) * L}
 
     def kelly(self, p=None, W=None, L=None) -> dict:
         stats = self.empirical()
-        p = stats["p"] if p is None else p
+        p_emp = stats["p"]
+        p_decay = self._decayed_p()
+        # Blend: use decayed p when enough data, else fall back to raw
+        p = p_emp if p is None else p
         W = stats["W"] if W is None else W
         L = stats["L"] if L is None else L
         q = 1 - p
         f_full = 0.0 if W <= 0 or L <= 0 else max(0.0, p / L - q / W)
+        # ATR volatility penalty: scale f down when ATR% is high
+        # f_adj = f * max(0.3, 1.0 - atr_pct * 10)   e.g. 5% ATR → 0.5×, 2% → 0.8×
+        vol_penalty = max(0.3, 1.0 - self.atr_pct * 10.0)
+        f_adj = f_full * vol_penalty
         return {
             "full_kelly": f_full,
-            "used": min(self.f_cap, f_full * self.fraction),
-            "p": p,
+            "full_kelly_decayed": max(0.0, p_decay / L - (1 - p_decay) / W) if W > 0 and L > 0 else 0.0,
+            "used": min(self.f_cap, f_adj * self.fraction),
+            "p_raw": p_emp,
+            "p_decayed": p_decay,
             "W": W,
             "L": L,
             "expectancy": p * W - q * L,
+            "atr_pct": self.atr_pct,
+            "vol_penalty": vol_penalty,
+            "n": stats["n"],
         }
 
     def risk_of_ruin(self, start, f, p, W, L, n_trades=40, n_sims=1000, ruin_level=0.20, seed=0):
@@ -416,6 +482,7 @@ class Desk:
         w = self.wallets.score(tok)
         reasons.extend(w["flags"])
         veto = False
+        veto_cat = []  # structured veto category for logging
         # Wallet veto strategy:
         # - theme-matched token: trust the theme, skip wallet veto entirely
         #   (theme signal from rebuild beats raw concentration heuristics)
@@ -434,8 +501,10 @@ class Desk:
         elif w["dump"] >= 0.9:
             # Single-holder risk: hard block UNLESS runner_escape (liq_growth>=5 or peak>=5x)
             wallet_block = not runner_escape
+            veto_cat.append(f"wallet_dump={w['dump']:.2f}" + (" ESCAPED" if runner_escape else ""))
         elif w["dump"] >= 0.67 and not runner_escape:
             wallet_block = True  # concentrated whale, but runner_escape bypasses
+            veto_cat.append(f"wallet_dump={w['dump']:.2f}")
         if wallet_block:
             veto = True
             reasons.append("RISK_VETO wallet")
@@ -443,7 +512,7 @@ class Desk:
             0.33 if self.narrative.cluster_centroid is not None else 0.12)
         if liq < thin_cut:
             veto = True
-            reasons.append("RISK_VETO thin_book")
+            reasons.append(f"RISK_VETO thin_book(liq={liq:.3f}<cut={thin_cut:.3f})")
         # 高 liq_growth (≥3x) 的无 theme pool 可能是未被识别的 runner → 放行
         if self.narrative.cluster_centroid is not None and n_score < self.narrative.min_match:
             if runner_escape:
@@ -578,7 +647,7 @@ class Desk:
         pnl = usd_out - pos.entry_usd
         self.bankroll += pnl
         r = pnl / pos.entry_usd
-        self.sizer.record(r)
+        self.sizer.record(r, wall_ts=time.monotonic())
         theme = f" {tok.theme_hint}" if tok.theme_hint else ""
         self.closed.append(
             {
@@ -694,7 +763,7 @@ class Desk:
         ruin = self.sizer.risk_of_ruin(
             self.bankroll,
             max(k["used"], 0.05),
-            max(k["p"], 0.15),
+            max(k.get("p") or k.get("p_decayed") or k.get("p_raw", 0.5), 0.15),
             max(k["W"], 1.2),
             max(k["L"], 0.3),
             n_trades=30,
@@ -921,6 +990,7 @@ def run_replay(verbose: bool = True, seed: int | None = 7, loss_pause_n: int = 3
         renderer._update(desk, 500)
         renderer.fig.canvas.flush_events()
         print("\n[live] replay finished — close the window to exit")
+        import matplotlib.pyplot as plt
         plt.show(block=True)
     if verbose:
         print("\n======== FEED ========")
@@ -940,6 +1010,7 @@ class LiveRenderer:
         self.interval_s = interval_ms / 1000.0
         self._last_draw = 0.0
 
+        import matplotlib.pyplot as plt
         plt.ion()
         self.fig = plt.figure(figsize=(14, 7), facecolor="#0b0f0c")
         # 3-row, 2-col layout:
@@ -1118,6 +1189,7 @@ def save_charts(desk: Desk, out_path: str = "rh_trencher_replay.png") -> str:
     axes[1].set_title("narrative embedding (green = hood cluster)")
     fig.tight_layout()
     fig.savefig(out_path, dpi=140)
+    import matplotlib.pyplot as plt
     plt.close(fig)
     return out_path
 

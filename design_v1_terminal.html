@@ -1,0 +1,1249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RB2 Jupiter — Terminal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Manrope:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0b0d;
+  --surface: #111317;
+  --surface2: #181c23;
+  --border: #232830;
+  --border-bright: #2e3540;
+  --text: #e4e8f0;
+  --text-dim: #6b7280;
+  --text-mid: #9ca3af;
+  --green: #22c55e;
+  --green-dim: #166534;
+  --green-glow: rgba(34,197,94,0.15);
+  --red: #ef4444;
+  --red-dim: #7f1d1d;
+  --amber: #f59e0b;
+  --amber-dim: #92400e;
+  --blue: #3b82f6;
+  --blue-dim: #1e3a5f;
+  --cyan: #06b6d4;
+  --purple: #a855f7;
+  --mono: 'JetBrains Mono', monospace;
+  --sans: 'Manrope', sans-serif;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-x: hidden;
+}
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width:4px; height:4px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:var(--border-bright); border-radius:2px; }
+
+/* ── Layout ── */
+.app {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  grid-template-rows: 48px 1fr;
+  min-height: 100vh;
+}
+.topbar {
+  grid-column: 1/-1;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  gap: 20px;
+  z-index: 100;
+  height: 48px;
+}
+.logo {
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0.08em;
+  color: var(--cyan);
+  text-transform: uppercase;
+}
+.logo span { color: var(--text-dim); font-weight: 400; }
+.topbar-sep { width:1px; height:20px; background:var(--border); }
+.topbar-stat {
+  display:flex; flex-direction:column; gap:1px;
+}
+.topbar-stat-label {
+  font-size:9px; text-transform:uppercase; letter-spacing:0.1em;
+  color:var(--text-dim); font-family:var(--mono);
+}
+.topbar-stat-val {
+  font-family:var(--mono); font-size:13px; font-weight:500; color:var(--text);
+}
+.topbar-stat-val.up { color:var(--green); }
+.topbar-stat-val.down { color:var(--red); }
+.topbar-spacer { flex:1; }
+.topbar-badge {
+  font-family:var(--mono); font-size:10px;
+  padding:2px 8px; border-radius:2px;
+  border:1px solid var(--border-bright);
+  color:var(--text-dim);
+  text-transform:uppercase; letter-spacing:0.08em;
+}
+.topbar-badge.live { border-color:var(--green); color:var(--green); background:var(--green-dim); }
+.topbar-badge.demo { border-color:var(--amber); color:var(--amber); background:var(--amber-dim); }
+
+.sidebar {
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  padding: 16px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.nav-section {
+  padding: 8px 16px 4px;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--text-dim);
+  font-family: var(--mono);
+}
+.nav-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 16px; cursor: pointer;
+  color: var(--text-mid);
+  transition: all 0.15s;
+  border-left: 2px solid transparent;
+  font-size: 12px;
+}
+.nav-item:hover { background:var(--surface2); color:var(--text); }
+.nav-item.active {
+  background: var(--surface2);
+  color: var(--cyan);
+  border-left-color: var(--cyan);
+}
+.nav-item svg { width:14px; height:14px; opacity:0.7; }
+.nav-item .badge {
+  margin-left:auto;
+  font-family:var(--mono); font-size:9px;
+  background:var(--blue-dim); color:var(--blue);
+  padding:1px 5px; border-radius:2px;
+}
+
+.main { overflow-y:auto; padding:20px 24px; }
+
+/* ── Metric Cards Row ── */
+.metrics-row {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 16px;
+}
+.metric-card {
+  background: var(--surface);
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 72px;
+  justify-content: center;
+}
+.metric-label {
+  font-size: 9px; text-transform:uppercase; letter-spacing:0.12em;
+  color:var(--text-dim); font-family:var(--mono);
+  margin-bottom:4px;
+}
+.metric-value {
+  font-family:var(--mono); font-size:22px; font-weight:700; color:var(--text);
+  line-height:1.1;
+  letter-spacing:-0.02em;
+}
+.metric-value.up { color:var(--green); }
+.metric-value.down { color:var(--red); }
+.metric-sub {
+  font-size:10px; color:var(--text-dim); font-family:var(--mono);
+  margin-top:2px;
+}
+.metric-sub span { color:var(--green); }
+.metric-sub span.red { color:var(--red); }
+
+/* ── Grid Layouts ── */
+.grid-2 { display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--border); border:1px solid var(--border); border-radius:4px; overflow:hidden; }
+.grid-3 { display:grid; grid-template-columns:1fr 1fr 1.2fr; gap:1px; background:var(--border); border:1px solid var(--border); border-radius:4px; overflow:hidden; }
+.grid-main-side { display:grid; grid-template-columns:minmax(0,1.3fr) minmax(380px,1fr); gap:1px; background:var(--border); border:1px solid var(--border); border-radius:4px; overflow:hidden; }
+.grid-full { border:1px solid var(--border); border-radius:4px; overflow:hidden; }
+
+.panel {
+  background: var(--surface);
+  padding: 0;
+}
+.panel.with-pad {
+  padding: 16px;
+}
+.panel-header {
+  display:flex; align-items:center; justify-content:space-between;
+  margin-bottom:12px;
+}
+.panel-title {
+  font-family:var(--mono); font-size:10px; text-transform:uppercase;
+  letter-spacing:0.12em; color:var(--text-dim);
+  display:flex; align-items:center; gap:8px;
+}
+.panel-title .dot {
+  width:6px; height:6px; border-radius:50%;
+  background:var(--green);
+  box-shadow:0 0 6px var(--green);
+}
+.panel-title .dot.amber { background:var(--amber); box-shadow:0 0 6px var(--amber); }
+.panel-title .dot.red { background:var(--red); box-shadow:0 0 6px var(--red); }
+.panel-title .dot.blue { background:var(--blue); box-shadow:0 0 6px var(--blue); }
+.panel-action {
+  font-family:var(--mono); font-size:9px; color:var(--text-dim);
+  cursor:pointer; text-transform:uppercase; letter-spacing:0.08em;
+}
+.panel-action:hover { color:var(--cyan); }
+
+/* ── Canvas Chart ── */
+.chart-wrap {
+  position:relative;
+  width:100%;
+  height:170px;
+  overflow:hidden;
+}
+.chart-wrap canvas { width:100%; height:100%; }
+.chart-overlay {
+  position:absolute; top:8px; left:12px;
+  display:flex; gap:16px;
+}
+.chart-legend {
+  font-family:var(--mono); font-size:10px;
+  display:flex; align-items:center; gap:5px;
+  color:var(--text-dim);
+}
+.chart-legend i {
+  width:8px; height:2px; display:inline-block;
+}
+
+/* ── Tables ── */
+.data-table { width:100%; border-collapse:collapse; table-layout:fixed; }
+.data-table th {
+  text-align:left;
+  font-family:var(--mono); font-size:9px;
+  text-transform:uppercase; letter-spacing:0.1em;
+  color:var(--text-dim); padding:8px 12px;
+  border-bottom:1px solid var(--border);
+  font-weight:400;
+  white-space:nowrap;
+  background:var(--surface2);
+}
+.data-table td {
+  padding:9px 12px;
+  font-family:var(--mono); font-size:11px;
+  border-bottom:1px solid var(--border);
+  vertical-align:middle;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.data-table tbody tr { transition:background 0.1s; }
+.data-table tbody tr:last-child td { border-bottom:none; }
+.data-table tbody tr:hover td { background:var(--surface2); }
+
+.ticker-cell {
+  display:flex; align-items:center; gap:8px;
+}
+.ticker-icon {
+  width:20px; height:20px; border-radius:50%;
+  display:flex; align-items:center; justify-content:center;
+  font-size:9px; font-weight:700; font-family:var(--sans);
+  flex-shrink:0;
+}
+.ticker-name { font-weight:600; color:var(--text); }
+.ticker-sub { font-size:9px; color:var(--text-dim); }
+
+.side-buy { color:var(--green); }
+.side-sell { color:var(--red); }
+.pnl-pos { color:var(--green); }
+.pnl-neg { color:var(--red); }
+
+.tag {
+  display:inline-block;
+  font-family:var(--mono); font-size:9px;
+  padding:1px 6px; border-radius:2px;
+  text-transform:uppercase; letter-spacing:0.05em;
+}
+.tag-okx { background:var(--blue-dim); color:var(--blue); }
+.tag-jup { background:rgba(168,85,247,0.15); color:var(--purple); }
+.tag-long { background:var(--green-dim); color:var(--green); }
+.tag-short { background:var(--red-dim); color:var(--red); }
+.tag-open { background:var(--surface2); color:var(--text-mid); border:1px solid var(--border); }
+
+/* ── Kelly Panel ── */
+.kelly-grid {
+  display:grid; grid-template-columns:1fr 1fr; gap:12px;
+}
+.kelly-metric {
+  display:flex; flex-direction:column; gap:3px;
+}
+.kelly-metric-label {
+  font-family:var(--mono); font-size:9px;
+  text-transform:uppercase; letter-spacing:0.1em;
+  color:var(--text-dim);
+}
+.kelly-metric-val {
+  font-family:var(--mono); font-size:16px; font-weight:600;
+}
+.kelly-bar-wrap { margin-top:4px; }
+.kelly-bar-bg {
+  height:3px; background:var(--border); border-radius:2px; overflow:hidden;
+}
+.kelly-bar-fill {
+  height:100%; border-radius:2px; transition:width 0.5s ease;
+}
+
+/* ── Feed ── */
+.feed-list { display:flex; flex-direction:column; gap:1px; }
+.feed-item {
+  display:flex; align-items:center; gap:8px;
+  padding:7px 12px;
+  border-bottom:1px solid var(--border);
+  font-family:var(--mono); font-size:10px;
+  cursor:pointer;
+  transition:background 0.1s;
+}
+.feed-item:hover { background:var(--surface2); }
+.feed-item:last-child { border-bottom:none; }
+.feed-time { color:var(--text-dim); font-size:9px; white-space:nowrap; flex-shrink:0; width:52px; text-align:right; font-variant-numeric:tabular-nums; }
+.feed-body { display:flex; flex-direction:column; gap:2px; flex:1; min-width:0; }
+.feed-ticker { font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:11px; }
+.feed-note { color:var(--text-dim); font-size:9px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.feed-pnl { text-align:right; white-space:nowrap; flex-shrink:0; font-size:10px; min-width:56px; padding-left:4px; font-variant-numeric:tabular-nums; }
+
+/* ── Decision Cards ── */
+.decision-list { display:flex; flex-direction:column; gap:8px; }
+.decision-card {
+  background:var(--surface2);
+  border:1px solid var(--border);
+  border-radius:4px;
+  padding:10px 12px;
+  display:grid; grid-template-columns:auto 1fr auto;
+  gap:10px; align-items:start;
+  transition:border-color 0.15s;
+}
+.decision-card:hover { border-color:var(--border-bright); }
+.decision-icon {
+  width:28px; height:28px; border-radius:4px;
+  display:flex; align-items:center; justify-content:center;
+  font-size:12px;
+}
+.decision-icon.buy { background:var(--green-dim); color:var(--green); }
+.decision-icon.sell { background:var(--red-dim); color:var(--red); }
+.decision-info {}
+.decision-top {
+  display:flex; align-items:center; gap:8px; margin-bottom:3px;
+}
+.decision-ticker { font-weight:600; font-size:12px; }
+.decision-tag { font-size:9px; }
+.decision-reasons { font-size:10px; color:var(--text-dim); line-height:1.4; }
+.decision-meta {
+  font-family:var(--mono); font-size:9px; color:var(--text-dim);
+  margin-top:4px; display:flex; gap:12px;
+}
+.decision-actions {
+  display:flex; flex-direction:column; gap:4px;
+}
+.btn-sm {
+  font-family:var(--mono); font-size:9px;
+  padding:3px 10px; border-radius:2px;
+  cursor:pointer; border:1px solid var(--border);
+  background:transparent; color:var(--text-mid);
+  text-transform:uppercase; letter-spacing:0.05em;
+  transition:all 0.15s;
+}
+.btn-sm:hover { border-color:var(--cyan); color:var(--cyan); }
+.btn-sm.confirm { border-color:var(--green-dim); color:var(--green); }
+.btn-sm.confirm:hover { background:var(--green-dim); }
+
+/* ── Builder Code ── */
+.builder-card {
+  background:var(--surface2);
+  border:1px solid var(--border);
+  border-radius:4px;
+  padding:10px 12px;
+}
+.builder-row {
+  display:flex; justify-content:space-between;
+  align-items:center;
+  padding:7px 0;
+  border-bottom:1px solid var(--border);
+  font-family:var(--mono); font-size:10px;
+}
+.builder-row:last-child { border-bottom:none; }
+.builder-label { color:var(--text-dim); }
+.builder-val { color:var(--text); font-weight:500; }
+.builder-val.green { color:var(--green); }
+
+/* ── Live Indicator Animation ── */
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+.live-dot { animation:blink 2s infinite; }
+
+/* ── Signal Filter Bar ── */
+.filter-bar {
+  display:flex; align-items:center; gap:6px;
+  padding:6px 12px;
+  border-bottom:1px solid var(--border);
+  flex-wrap:wrap;
+}
+.filter-group { display:flex; align-items:center; gap:4px; }
+.filter-label {
+  font-family:var(--mono); font-size:9px;
+  text-transform:uppercase; letter-spacing:0.1em;
+  color:var(--text-dim); margin-right:4px;
+}
+.filter-tab {
+  font-family:var(--mono); font-size:9px;
+  padding:2px 8px; border-radius:2px;
+  border:1px solid var(--border);
+  background:transparent; color:var(--text-mid);
+  cursor:pointer; text-transform:uppercase;
+  letter-spacing:0.05em; transition:all 0.15s;
+}
+.filter-tab:hover { border-color:var(--border-bright); color:var(--text); }
+.filter-tab.active { border-color:var(--cyan); color:var(--cyan); background:rgba(6,182,212,0.08); }
+.filter-tab.active.buy { border-color:var(--green); color:var(--green); background:var(--green-dim); }
+.filter-tab.active.sell { border-color:var(--red); color:var(--red); background:var(--red-dim); }
+.filter-tab.active.reject { border-color:var(--text-dim); color:var(--text-dim); background:rgba(107,114,128,0.1); }
+.filter-tab.active.halt { border-color:var(--amber); color:var(--amber); background:var(--amber-dim); }
+.filter-search {
+  font-family:var(--mono); font-size:10px;
+  background:var(--surface2); border:1px solid var(--border);
+  color:var(--text); padding:3px 8px; border-radius:2px;
+  width:100px; outline:none; transition:border-color 0.15s;
+}
+.filter-search:focus { border-color:var(--cyan); }
+.filter-search::placeholder { color:var(--text-dim); }
+.feed-item.hidden { display:none; }
+
+/* ── Signing Progress ── */
+.signing-progress { display:flex; flex-direction:column; gap:0; }
+.sign-step {
+  display:grid; grid-template-columns:36px 1fr auto;
+  align-items:center; gap:12px;
+  padding:11px 16px;
+  border-bottom:1px solid var(--border);
+  transition:background 0.1s;
+}
+.sign-step:hover { background:var(--surface2); }
+.sign-step:last-child { border-bottom:none; }
+.sign-step-circle {
+  width:32px; height:32px; border-radius:50%; flex-shrink:0;
+  display:flex; align-items:center; justify-content:center;
+  font-family:var(--mono); font-size:11px; font-weight:700;
+  border:2px solid var(--border); color:var(--text-dim);
+  background:var(--surface2);
+}
+.sign-step.done .sign-step-circle {
+  border-color:var(--green); color:var(--green);
+  background:var(--green-dim);
+  box-shadow:0 0 10px rgba(34,197,94,0.3);
+}
+.sign-step.active .sign-step-circle {
+  border-color:var(--cyan); color:var(--cyan);
+  background:rgba(6,182,212,0.1);
+  box-shadow:0 0 10px rgba(6,182,212,0.3);
+  animation:pulse-ring 1.5s infinite;
+}
+.sign-step.waiting .sign-step-circle {
+  border-color:var(--border-bright); color:var(--text-dim);
+}
+@keyframes pulse-ring {
+  0%,100% { box-shadow:0 0 10px rgba(6,182,212,0.3); }
+  50% { box-shadow:0 0 20px rgba(6,182,212,0.6); }
+}
+.sign-step-info {}
+.sign-step-label {
+  font-family:var(--mono); font-size:11px; font-weight:600;
+  color:var(--text); text-transform:uppercase; letter-spacing:0.05em;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.sign-step-sub {
+  font-size:9px; color:var(--text-dim); margin-top:2px;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.sign-step.done .sign-step-label { color:var(--green); }
+.sign-step.active .sign-step-label { color:var(--cyan); }
+.sign-step-status {
+  font-family:var(--mono); font-size:9px; flex-shrink:0;
+  padding:2px 8px; border-radius:2px;
+  text-transform:uppercase; letter-spacing:0.05em;
+  white-space:nowrap;
+}
+.sign-step.done .sign-step-status { color:var(--green); background:var(--green-dim); }
+.sign-step.active .sign-step-status { color:var(--cyan); background:rgba(6,182,212,0.1); }
+.sign-step.waiting .sign-step-status { color:var(--text-dim); background:transparent; }
+
+/* Spinner for active step */
+.spinner {
+  display:inline-block; width:8px; height:8px;
+  border:1.5px solid var(--cyan); border-top-color:transparent;
+  border-radius:50%; animation:spin 0.8s linear infinite;
+  vertical-align:middle; margin-right:4px;
+}
+@keyframes spin { to { transform:rotate(360deg); } }
+
+/* Responsive */
+@media(max-width:1200px) {
+  .metrics-row { grid-template-columns:repeat(3,1fr); }
+  .grid-main-side { grid-template-columns:1fr; }
+}
+@media(max-width:900px) {
+  .app { grid-template-columns:1fr; }
+  .sidebar { display:none; }
+  .metrics-row { grid-template-columns:repeat(2,1fr); }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- Top Bar -->
+  <div class="topbar">
+    <div class="logo">RB2<span>/jupiter</span></div>
+    <div class="topbar-sep"></div>
+    <div class="topbar-stat">
+      <div class="topbar-stat-label">Equity</div>
+      <div class="topbar-stat-val up">$128,492.37</div>
+    </div>
+    <div class="topbar-stat">
+      <div class="topbar-stat-label">24h PnL</div>
+      <div class="topbar-stat-val up">+$4,218.00 (+3.4%)</div>
+    </div>
+    <div class="topbar-stat">
+      <div class="topbar-stat-label">Win Rate</div>
+      <div class="topbar-stat-val">62.3%</div>
+    </div>
+    <div class="topbar-stat">
+      <div class="topbar-stat-label">Trades</div>
+      <div class="topbar-stat-val">147</div>
+    </div>
+    <div class="topbar-stat">
+      <div class="topbar-stat-label">Kelly Used</div>
+      <div class="topbar-stat-val">0.0847</div>
+    </div>
+    <div class="topbar-spacer"></div>
+    <div class="topbar-badge demo">Demo</div>
+    <div class="topbar-badge live">● LIVE</div>
+  </div>
+
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="nav-section">Overview</div>
+    <div class="nav-item active">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+      Dashboard
+    </div>
+    <div class="nav-item">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+      Positions
+      <span class="badge">3</span>
+    </div>
+    <div class="nav-item">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+      Trades
+    </div>
+    <div class="nav-section">Engine</div>
+    <div class="nav-item">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93A10 10 0 1 0 4.93 19.07"/></svg>
+      OKX Spot
+    </div>
+    <div class="nav-item">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+      Perp Engine
+    </div>
+    <div class="nav-item">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+      Jupiter Swaps
+    </div>
+    <div class="nav-section">Analytics</div>
+    <div class="nav-item">
+      <svg viewBox="0 0 24 24" fill="none" stroke=" a="currentColor" stroke-width="2"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></svg>
+      Kelly Criterion
+    </div>
+    <div class="nav-item">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+      Reports
+    </div>
+  </div>
+
+  <!-- Main Content -->
+  <div class="main">
+    <!-- Metrics Row -->
+    <div class="metrics-row">
+      <div class="metric-card">
+        <div class="metric-label">Bankroll</div>
+        <div class="metric-value">$128,492</div>
+        <div class="metric-sub">Start: $100,000 <span>+28.5%</span></div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">24h PnL</div>
+        <div class="metric-value up">+$4,218</div>
+        <div class="metric-sub"><span>+3.40%</span> from yesterday</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Open Positions</div>
+        <div class="metric-value">3</div>
+        <div class="metric-sub">2 spot · 1 perp <span class="red">avg -1.2%</span></div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Kelly Fraction</div>
+        <div class="metric-value">0.085</div>
+        <div class="metric-sub">ATR penalty: 0.300 · p_raw: 0.623</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Builder Code</div>
+        <div class="metric-value" style="font-size:14px">RB2-JUP</div>
+        <div class="metric-sub">Comm returned: <span>$128.40</span></div>
+      </div>
+    </div>
+
+    <!-- Chart + Feed -->
+    <div class="grid-main-side" style="margin-bottom:16px">
+      <div class="panel with-pad" style="padding:0">
+        <div class="panel-header" style="padding:14px 16px 0;display:flex;align-items:center;justify-content:space-between">
+          <div class="panel-title"><span class="dot live-dot"></span> Equity Curve</div>
+          <div style="display:flex;gap:12px">
+            <span class="panel-action" style="color:var(--cyan)">1H</span>
+            <span class="panel-action">4H</span>
+            <span class="panel-action">1D</span>
+            <span class="panel-action">ALL</span>
+          </div>
+        </div>
+        <div class="chart-wrap" style="padding:0 16px 12px">
+          <canvas id="equityChart"></canvas>
+        </div>
+      </div>
+      <div class="panel with-pad" style="padding:0">
+        <div class="panel-header" style="padding:14px 16px 8px 16px;margin-bottom:0">
+          <div class="panel-title"><span class="dot amber"></span> Signal Feed</div>
+        </div>
+        <div class="filter-bar">
+          <div class="filter-group">
+            <span class="filter-label">Type</span>
+            <button class="filter-tab active" data-filter="type" data-value="all">ALL</button>
+            <button class="filter-tab" data-filter="type" data-value="buy">BUY</button>
+            <button class="filter-tab" data-filter="type" data-value="sell">SELL</button>
+            <button class="filter-tab" data-filter="type" data-value="reject">REJECT</button>
+            <button class="filter-tab" data-filter="type" data-value="halt">HALT</button>
+          </div>
+          <div style="width:1px;height:16px;background:var(--border);margin:0 4px"></div>
+          <div class="filter-group">
+            <span class="filter-label">Platform</span>
+            <button class="filter-tab active" data-filter="platform" data-value="all">ALL</button>
+            <button class="filter-tab" data-filter="platform" data-value="okx">OKX</button>
+            <button class="filter-tab" data-filter="platform" data-value="jup">JUP</button>
+          </div>
+          <div style="flex:1"></div>
+          <input class="filter-search" type="text" placeholder="Search ticker..." id="tickerSearch">
+        </div>
+        <div class="feed-list" style="max-height:320px;overflow-y:auto">
+          <div class="feed-item" data-type="buy" data-platform="jup">
+            <div class="feed-time">14:32:08</div>
+            <div class="feed-body">
+              <div class="feed-ticker"><span class="side-buy">BUY</span> PEPE-USDT · $2,400</div>
+              <div class="feed-note">narrative_score=0.81 · holder_concentrated</div>
+            </div>
+            <div class="feed-pnl side-buy">ENTRY</div>
+          </div>
+          <div class="feed-item" data-type="sell" data-platform="okx">
+            <div class="feed-time">14:28:41</div>
+            <div class="feed-body">
+              <div class="feed-ticker"><span class="side-sell">SELL</span> BONK-USDT · $1,800</div>
+              <div class="feed-note">take_profit · mult=2.14x</div>
+            </div>
+            <div class="feed-pnl pnl-pos">+$810</div>
+          </div>
+          <div class="feed-item" data-type="buy" data-platform="okx">
+            <div class="feed-time">14:15:22</div>
+            <div class="feed-body">
+              <div class="feed-ticker"><span class="side-buy">BUY</span> WIF-USDT · $3,200</div>
+              <div class="feed-note">kelly_used=0.085 · atr_penalty=0.30</div>
+            </div>
+            <div class="feed-pnl side-buy">ENTRY</div>
+          </div>
+          <div class="feed-item" data-type="sell" data-platform="okx">
+            <div class="feed-time">13:58:10</div>
+            <div class="feed-body">
+              <div class="feed-ticker"><span class="side-sell">SELL</span> SHIB-USDT · $900</div>
+              <div class="feed-note">stop_loss · mult=0.87x</div>
+            </div>
+            <div class="feed-pnl pnl-neg">-$117</div>
+          </div>
+          <div class="feed-item" data-type="buy" data-platform="okx">
+            <div class="feed-time">13:42:55</div>
+            <div class="feed-body">
+              <div class="feed-ticker"><span class="side-buy">BUY</span> DOGE-USDT · $1,500</div>
+              <div class="feed-note">liq_growth=1.24 · narrative=0.72</div>
+            </div>
+            <div class="feed-pnl side-buy">ENTRY</div>
+          </div>
+          <div class="feed-item" data-type="sell" data-platform="okx">
+            <div class="feed-time">13:20:03</div>
+            <div class="feed-body">
+              <div class="feed-ticker"><span class="side-sell">SELL</span> FLOKI-USDT · $2,100</div>
+              <div class="feed-note">time_limit · mult=1.31x</div>
+            </div>
+            <div class="feed-pnl pnl-pos">+$294</div>
+          </div>
+          <div class="feed-item" data-type="buy" data-platform="jup">
+            <div class="feed-time">12:55:47</div>
+            <div class="feed-body">
+              <div class="feed-ticker"><span class="side-buy">BUY</span> PEDRO-USDT · $800</div>
+              <div class="feed-note">jupiter_swap · slippage=0.8%</div>
+            </div>
+            <div class="feed-pnl side-buy">ENTRY</div>
+          </div>
+          <div class="feed-item" data-type="reject" data-platform="okx">
+            <div class="feed-time">12:30:15</div>
+            <div class="feed-body">
+              <div class="feed-ticker" style="color:var(--text-dim)">✗ REJECT</span> RATS-USDT · $600</div>
+              <div class="feed-note">liquidity_check_failed · pool <$5k</div>
+            </div>
+            <div class="feed-pnl" style="color:var(--text-dim)">BLOCKED</div>
+          </div>
+          <div class="feed-item" data-type="halt" data-platform="okx">
+            <div class="feed-time">11:58:02</div>
+            <div class="feed-body">
+              <div class="feed-ticker" style="color:var(--amber)">⚠ HALT</span> BTC-USDT</div>
+              <div class="feed-note">risk_veto · volatility_spike 4.2σ</div>
+            </div>
+            <div class="feed-pnl" style="color:var(--amber)">HALTED</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Positions + Decisions -->
+    <div class="grid-2" style="margin-bottom:16px">
+      <div class="panel with-pad" style="padding:0">
+        <div class="panel-header" style="padding:14px 16px 0;display:flex;align-items:center;justify-content:space-between">
+          <div class="panel-title"><span class="dot blue"></span> Open Positions</div>
+          <span class="panel-action">View All →</span>
+        </div>
+        <table class="data-table">
+          <thead>
+            <tr><th>Ticker</th><th>Side</th><th>Entry</th><th>Current</th><th>PnL</th><th>Mult</th><th>Platform</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><div class="ticker-cell"><div class="ticker-icon" style="background:var(--green-dim);color:var(--green)">W</div><div><div class="ticker-name">WIF</div><div class="ticker-sub">USDT</div></div></div></td>
+              <td><span class="tag tag-long">LONG</span></td>
+              <td>$1.842</td>
+              <td>$1.901</td>
+              <td class="pnl-pos">+$234</td>
+              <td style="color:var(--green)">1.032x</td>
+              <td><span class="tag tag-okx">OKX</span></td>
+            </tr>
+            <tr>
+              <td><div class="ticker-cell"><div class="ticker-icon" style="background:rgba(168,85,247,0.15);color:var(--purple)">P</div><div><div class="ticker-name">PEPE</div><div class="ticker-sub">USDT</div></div></div></td>
+              <td><span class="tag tag-long">LONG</span></td>
+              <td>$0.00721</td>
+              <td>$0.00718</td>
+              <td class="pnl-neg">-$52</td>
+              <td style="color:var(--red)">0.996x</td>
+              <td><span class="tag tag-jup">JUP</span></td>
+            </tr>
+            <tr>
+              <td><div class="ticker-cell"><div class="ticker-icon" style="background:var(--amber-dim);color:var(--amber)">D</div><div><div class="ticker-name">DOGE</div><div class="ticker-sub">USDT</div></div></div></td>
+              <td><span class="tag tag-short">SHORT</span></td>
+              <td>$0.1842</td>
+              <td>$0.1819</td>
+              <td class="pnl-pos">+$118</td>
+              <td style="color:var(--green)">1.012x</td>
+              <td><span class="tag tag-okx">OKX</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="panel with-pad" style="padding:0">
+        <div class="panel-header" style="padding:14px 16px 8px 16px;display:flex;align-items:center;justify-content:space-between">
+          <div class="panel-title"><span class="dot"></span> AI Decisions</div>
+          <span class="panel-action">History →</span>
+        </div>
+        <div class="decision-list" style="padding:4px 16px 16px">
+          <div class="decision-card">
+            <div class="decision-icon buy">↑</div>
+            <div class="decision-info">
+              <div class="decision-top">
+                <span class="decision-ticker">PEPE/USDT</span>
+                <span class="tag tag-okx" style="font-size:8px">SPOT</span>
+                <span class="tag tag-long" style="font-size:8px">BUY</span>
+              </div>
+              <div class="decision-reasons">narrative strong · holder cluster detected · liq growth accelerating</div>
+              <div class="decision-meta"><span>size: 1.87% bankroll</span><span>kelly: 0.085</span><span>14:32 UTC</span></div>
+            </div>
+            <div class="decision-actions">
+              <button class="btn-sm confirm">Confirm</button>
+              <button class="btn-sm">Ignore</button>
+            </div>
+          </div>
+          <div class="decision-card">
+            <div class="decision-icon sell">↓</div>
+            <div class="decision-info">
+              <div class="decision-top">
+                <span class="decision-ticker">BONK/USDT</span>
+                <span class="tag tag-okx" style="font-size:8px">TAKE PROFIT</span>
+              </div>
+              <div class="decision-reasons">target mult 2.0x reached · trailing stop active</div>
+              <div class="decision-meta"><span>pnl: +$810</span><span>2.14x</span><span>14:28 UTC</span></div>
+            </div>
+            <div class="decision-actions">
+              <button class="btn-sm confirm">Execute</button>
+              <button class="btn-sm">Delay</button>
+            </div>
+          </div>
+          <div class="decision-card">
+            <div class="decision-icon buy" style="background:var(--red-dim);color:var(--red)">↓</div>
+            <div class="decision-info">
+              <div class="decision-top">
+                <span class="decision-ticker">SHIB/USDT</span>
+                <span class="tag tag-okx" style="font-size:8px">STOP LOSS</span>
+              </div>
+              <div class="decision-reasons">mult dropped to 0.87x · ATR trigger</div>
+              <div class="decision-meta"><span>pnl: -$117</span><span>0.87x</span><span>13:58 UTC</span></div>
+            </div>
+            <div class="decision-actions">
+              <button class="btn-sm" style="border-color:var(--red-dim);color:var(--red)">Acknowledge</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Kelly + History -->
+    <div class="grid-2" style="margin-bottom:16px">
+      <div class="panel with-pad" style="padding:0">
+        <div class="panel-header" style="padding:14px 16px 8px 16px;margin-bottom:0">
+          <div class="panel-title"><span class="dot" style="background:var(--purple);box-shadow:0 0 6px var(--purple)"></span> Kelly Criterion</div>
+        </div>
+        <div class="panel-body" style="padding:12px 16px 16px">
+          <div class="kelly-grid">
+            <div class="kelly-metric">
+              <div class="kelly-metric-label">Win Rate (raw)</div>
+              <div class="kelly-metric-val" style="color:var(--green)">62.3%</div>
+            </div>
+            <div class="kelly-metric">
+              <div class="kelly-metric-label">Win Rate (decayed)</div>
+              <div class="kelly-metric-val" style="color:var(--cyan)">58.1%</div>
+            </div>
+            <div class="kelly-metric">
+              <div class="kelly-metric-label">Full Kelly</div>
+              <div class="kelly-metric-val">0.247</div>
+            </div>
+            <div class="kelly-metric">
+              <div class="kelly-metric-label">Used (capped)</div>
+              <div class="kelly-metric-val" style="color:var(--amber)">0.085</div>
+            </div>
+            <div class="kelly-metric">
+              <div class="kelly-metric-label">Avg Win Multiplier</div>
+              <div class="kelly-metric-val" style="color:var(--green)">2.14x</div>
+            </div>
+            <div class="kelly-metric">
+              <div class="kelly-metric-label">Avg Loss Multiplier</div>
+              <div class="kelly-metric-val" style="color:var(--red)">0.87x</div>
+            </div>
+            <div class="kelly-metric">
+              <div class="kelly-metric-label">Expectancy</div>
+              <div class="kelly-metric-val" style="color:var(--green)">+0.891</div>
+            </div>
+            <div class="kelly-metric">
+              <div class="kelly-metric-label">ATR Vol Penalty</div>
+              <div class="kelly-metric-val" style="color:var(--amber)">0.300</div>
+            </div>
+          </div>
+          <div style="margin-top:14px">
+            <div class="kelly-metric-label" style="margin-bottom:6px">Kelly Utilization vs Cap</div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="kelly-bar-wrap" style="flex:1">
+                <div class="kelly-bar-bg">
+                  <div class="kelly-bar-fill" style="width:56%;background:var(--green)"></div>
+                </div>
+              </div>
+              <span class="kelly-metric-val" style="font-size:13px;color:var(--green)">56%</span>
+              <span style="font-size:10px;color:var(--text-dim);font-family:var(--mono)">cap=0.15</span>
+            </div>
+          </div>
+          <div style="margin-top:10px">
+            <div class="kelly-metric-label" style="margin-bottom:6px">Trades in Window</div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="kelly-bar-wrap" style="flex:1">
+                <div class="kelly-bar-bg">
+                  <div class="kelly-bar-fill" style="width:31%;background:var(--blue)"></div>
+                </div>
+              </div>
+              <span class="kelly-metric-val" style="font-size:13px">147</span>
+              <span style="font-size:10px;color:var(--text-dim);font-family:var(--mono)">history</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="panel with-pad" style="padding:0">
+        <div class="panel-header" style="padding:14px 16px 8px 16px;margin-bottom:0;display:flex;align-items:center;justify-content:space-between">
+          <div class="panel-title"><span class="dot" style="background:var(--text-dim);box-shadow:none"></span> Recent Trades</div>
+          <span class="panel-action">Export CSV →</span>
+        </div>
+        <table class="data-table">
+          <thead>
+            <tr><th>Ticker</th><th>Side</th><th>PnL</th><th>Mult</th><th>Reason</th><th>Time</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="ticker-name">BONK</span></td>
+              <td><span class="side-sell">SELL</span></td>
+              <td class="pnl-pos">+$810</td>
+              <td style="color:var(--green)">2.14x</td>
+              <td><span class="tag tag-open">TP</span></td>
+              <td style="color:var(--text-dim)">14:28</td>
+            </tr>
+            <tr>
+              <td><span class="ticker-name">FLOKI</span></td>
+              <td><span class="side-sell">SELL</span></td>
+              <td class="pnl-pos">+$294</td>
+              <td style="color:var(--green)">1.31x</td>
+              <td><span class="tag tag-open">TIME</span></td>
+              <td style="color:var(--text-dim)">13:20</td>
+            </tr>
+            <tr>
+              <td><span class="ticker-name">SHIB</span></td>
+              <td><span class="side-sell">SELL</span></td>
+              <td class="pnl-neg">-$117</td>
+              <td style="color:var(--red)">0.87x</td>
+              <td><span class="tag tag-open" style="background:var(--red-dim);color:var(--red)">SL</span></td>
+              <td style="color:var(--text-dim)">13:58</td>
+            </tr>
+            <tr>
+              <td><span class="ticker-name">LINK</span></td>
+              <td><span class="side-sell">SELL</span></td>
+              <td class="pnl-pos">+$432</td>
+              <td style="color:var(--green)">1.76x</td>
+              <td><span class="tag tag-open">TP</span></td>
+              <td style="color:var(--text-dim)">12:45</td>
+            </tr>
+            <tr>
+              <td><span class="ticker-name">AVAX</span></td>
+              <td><span class="side-sell">SELL</span></td>
+              <td class="pnl-neg">-$89</td>
+              <td style="color:var(--red)">0.93x</td>
+              <td><span class="tag tag-open">TIME</span></td>
+              <td style="color:var(--text-dim)">11:30</td>
+            </tr>
+            <tr>
+              <td><span class="ticker-name">SOL</span></td>
+              <td><span class="side-sell">SELL</span></td>
+              <td class="pnl-pos">+$1,204</td>
+              <td style="color:var(--green)">2.87x</td>
+              <td><span class="tag tag-open">TP</span></td>
+              <td style="color:var(--text-dim)">10:15</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Builder Code + Bottom Status -->
+    <div class="grid-3" style="margin-bottom:16px">
+      <div class="panel with-pad">
+        <div class="panel-title" style="margin-bottom:12px"><span class="dot" style="background:var(--amber);box-shadow:0 0 6px var(--amber)"></span> Builder Code Commission</div>
+        <div class="builder-card">
+          <div class="builder-row"><span class="builder-label">Code</span><span class="builder-val" style="font-family:var(--mono);color:var(--cyan)">RB2-JUPITER</span></div>
+          <div class="builder-row"><span class="builder-label">Total Commission</span><span class="builder-val green">+$128.40</span></div>
+          <div class="builder-row"><span class="builder-label">Today</span><span class="builder-val green">+$18.20</span></div>
+          <div class="builder-row"><span class="builder-label">Trades</span><span class="builder-val">47</span></div>
+          <div class="builder-row"><span class="builder-label">Attributed</span><span class="builder-val green">100%</span></div>
+        </div>
+      </div>
+      <div class="panel with-pad">
+        <div class="panel-title" style="margin-bottom:12px"><span class="dot blue"></span> Platform Status</div>
+        <div class="builder-card">
+          <div class="builder-row"><span class="builder-label">OKX Spot</span><span class="tag tag-long" style="font-size:8px">CONNECTED</span></div>
+          <div class="builder-row"><span class="builder-label">OKX Perp</span><span class="tag tag-long" style="font-size:8px">CONNECTED</span></div>
+          <div class="builder-row"><span class="builder-label">Jupiter</span><span class="tag tag-jup" style="font-size:8px">SERVER SIGN</span></div>
+          <div class="builder-row"><span class="builder-label">Mode</span><span class="builder-val" style="color:var(--amber)">DEMO</span></div>
+          <div class="builder-row"><span class="builder-label">Risk Pref</span><span class="builder-val">BALANCED</span></div>
+          <div class="builder-row"><span class="builder-label">Trade Mode</span><span class="builder-val" style="color:var(--cyan)">AUTO</span></div>
+        </div>
+      </div>
+      <div class="panel with-pad">
+        <div class="panel-title" style="margin-bottom:12px"><span class="dot" style="background:var(--cyan);box-shadow:0 0 6px var(--cyan)"></span> Signing Progress</div>
+        <div class="signing-progress">
+          <div class="sign-step done">
+            <div class="sign-step-circle">✓</div>
+            <div class="sign-step-info">
+              <div class="sign-step-label">TX Generated</div>
+              <div class="sign-step-sub">SwapBundle created · req_id=a8f3..9x2k</div>
+            </div>
+            <span class="sign-step-status">DONE</span>
+          </div>
+          <div class="sign-step done">
+            <div class="sign-step-circle">✓</div>
+            <div class="sign-step-info">
+              <div class="sign-step-label">Key Loaded</div>
+              <div class="sign-step-sub">Ed25519 wallet · pubkey exposed</div>
+            </div>
+            <span class="sign-step-status">DONE</span>
+          </div>
+          <div class="sign-step active">
+            <div class="sign-step-circle">3</div>
+            <div class="sign-step-info">
+              <div class="sign-step-label"><span class="spinner"></span>Signing</div>
+              <div class="sign-step-sub">Server-side ed25519 sign · PEDRO-USDT</div>
+            </div>
+            <span class="sign-step-status">…</span>
+          </div>
+          <div class="sign-step waiting">
+            <div class="sign-step-circle">4</div>
+            <div class="sign-step-info">
+              <div class="sign-step-label">Signed</div>
+              <div class="sign-step-sub">Signature ready · base64 encoded</div>
+            </div>
+            <span class="sign-step-status">—</span>
+          </div>
+          <div class="sign-step waiting">
+            <div class="sign-step-circle">5</div>
+            <div class="sign-step-info">
+              <div class="sign-step-label">Submitted</div>
+              <div class="sign-step-sub">Jupiter API · pending confirmation</div>
+            </div>
+            <span class="sign-step-status">—</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// Equity curve chart
+const canvas = document.getElementById('equityChart');
+const ctx = canvas.getContext('2d');
+
+function resize() {
+  const wrap = canvas.parentElement;
+  const cs = getComputedStyle(wrap);
+  const rect = wrap.getBoundingClientRect();
+  const padX = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
+  const padY = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom);
+  // 用内容区宽高（扣掉 padding）设置 canvas，避免向右溢出挤占 Signal Feed
+  const cw = rect.width - padX;
+  const ch = rect.height - padY;
+  canvas.width = cw * 2;
+  canvas.height = ch * 2;
+  ctx.scale(2, 2);
+  canvas.style.width = cw + 'px';
+  canvas.style.height = ch + 'px';
+}
+resize();
+window.addEventListener('resize', () => { resize(); draw(); });
+
+// Generate realistic equity data
+function generateEquity(n, start, volatility) {
+  const data = [start];
+  for (let i = 1; i < n; i++) {
+    const drift = 0.0003;
+    const shock = (Math.random() - 0.48) * volatility;
+    data.push(data[i-1] * (1 + drift + shock));
+  }
+  return data;
+}
+const equity = generateEquity(200, 100000, 0.008);
+const peak = Math.max(...equity);
+const trough = Math.min(...equity);
+const w = canvas.style.width ? parseFloat(canvas.style.width) : 800;
+const h = 220;
+
+function draw() {
+  const W = parseFloat(canvas.style.width);
+  const H = parseFloat(canvas.style.height);
+  ctx.clearRect(0, 0, W, H);
+
+  const range = peak - trough || 1;
+  const pad = { t: 20, b: 20, l: 0, r: 0 };
+  const cw = W - pad.l - pad.r;
+  const ch = H - pad.t - pad.b;
+
+  // Gradient fill
+  const grad = ctx.createLinearGradient(0, pad.t, 0, H - pad.b);
+  grad.addColorStop(0, 'rgba(34, 197, 94, 0.12)');
+  grad.addColorStop(1, 'rgba(34, 197, 94, 0)');
+
+  ctx.beginPath();
+  ctx.moveTo(pad.l, H - pad.b);
+  for (let i = 0; i < equity.length; i++) {
+    const x = pad.l + (i / (equity.length - 1)) * cw;
+    const y = pad.t + (1 - (equity[i] - trough) / range) * ch;
+    if (i === 0) ctx.lineTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.lineTo(pad.l + cw, H - pad.b);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Line
+  ctx.beginPath();
+  for (let i = 0; i < equity.length; i++) {
+    const x = pad.l + (i / (equity.length - 1)) * cw;
+    const y = pad.t + (1 - (equity[i] - trough) / range) * ch;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.strokeStyle = '#22c55e';
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+
+  // Start & end dots
+  const startX = pad.l, startY = pad.t + (1 - (equity[0] - trough) / range) * ch;
+  const endX = pad.l + cw, endY = pad.t + (1 - (equity[equity.length-1] - trough) / range) * ch;
+
+  ctx.beginPath();
+  ctx.arc(startX, startY, 3, 0, Math.PI * 2);
+  ctx.fillStyle = '#6b7280';
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.arc(endX, endY, 4, 0, Math.PI * 2);
+  ctx.fillStyle = '#22c55e';
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(endX, endY, 7, 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(34,197,94,0.3)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // End value label
+  ctx.fillStyle = '#e4e8f0';
+  ctx.font = '600 10px "JetBrains Mono"';
+  ctx.textAlign = 'right';
+  ctx.fillText('$' + equity[equity.length-1].toLocaleString(undefined, {minimumFractionDigits:0, maximumFractionDigits:0}), endX - 12, endY - 8);
+
+  // Horizontal grid lines
+  ctx.strokeStyle = 'rgba(35,40,48,0.8)';
+  ctx.lineWidth = 0.5;
+  for (let i = 1; i < 4; i++) {
+    const y = pad.t + (i / 4) * ch;
+    ctx.beginPath();
+    ctx.moveTo(pad.l, y);
+    ctx.lineTo(pad.l + cw, y);
+    ctx.stroke();
+  }
+}
+draw();
+
+// ── Signal Feed Filter ──
+const filterTabs = document.querySelectorAll('.filter-tab');
+const feedItems = document.querySelectorAll('.feed-item');
+const tickerSearch = document.getElementById('tickerSearch');
+
+let activeType = 'all';
+let activePlatform = 'all';
+let searchQuery = '';
+
+function applyFilters() {
+  feedItems.forEach(item => {
+    const type = item.dataset.type;
+    const platform = item.dataset.platform;
+    const tickerText = item.textContent.toUpperCase();
+    const matchType = activeType === 'all' || type === activeType;
+    const matchPlatform = activePlatform === 'all' || platform === activePlatform;
+    const matchSearch = !searchQuery || tickerText.includes(searchQuery.toUpperCase());
+    item.classList.toggle('hidden', !(matchType && matchPlatform && matchSearch));
+  });
+}
+
+filterTabs.forEach(tab => {
+  tab.addEventListener('click', () => {
+    const filterType = tab.dataset.filter;
+    const value = tab.dataset.value;
+    // Deactivate siblings
+    filterTabs.forEach(t => {
+      if (t.dataset.filter === filterType) {
+        t.classList.remove('active', 'buy', 'sell', 'reject', 'halt');
+      }
+    });
+    // Activate clicked
+    tab.classList.add('active', value);
+    if (filterType === 'type') activeType = value;
+    else if (filterType === 'platform') activePlatform = value;
+    applyFilters();
+  });
+});
+
+tickerSearch.addEventListener('input', (e) => {
+  searchQuery = e.target.value.trim();
+  applyFilters();
+});
+
+// ── Signing Progress Animation ──
+const signSteps = document.querySelectorAll('.sign-step');
+const signLabels = ['TX Generated', 'Key Loaded', 'Signing', 'Signed', 'Submitted'];
+const signSubs = [
+  'SwapBundle created · req_id=a8f3..9x2k',
+  'Ed25519 wallet · pubkey exposed',
+  'Server-side ed25519 sign · PEDRO-USDT',
+  'Signature ready · base64 encoded',
+  'Jupiter API · pending confirmation'
+];
+let currentStep = 2; // 0-indexed, currently on step 2 (Signing)
+
+function advanceSigning() {
+  signSteps.forEach((step, i) => {
+    step.classList.remove('done', 'active', 'waiting');
+    const circle = step.querySelector('.sign-step-circle');
+    const label = step.querySelector('.sign-step-label');
+    const sub = step.querySelector('.sign-step-sub');
+    const status = step.querySelector('.sign-step-status');
+
+    if (i < currentStep) {
+      step.classList.add('done');
+      circle.textContent = '✓';
+      label.innerHTML = signLabels[i];
+      sub.textContent = signSubs[i];
+      status.textContent = 'DONE';
+    } else if (i === currentStep) {
+      step.classList.add('active');
+      circle.textContent = i + 1;
+      label.innerHTML = '<span class="spinner"></span>' + signLabels[i];
+      sub.textContent = signSubs[i];
+      status.textContent = '…';
+    } else {
+      step.classList.add('waiting');
+      circle.textContent = i + 1;
+      label.textContent = signLabels[i];
+      sub.textContent = signSubs[i];
+      status.textContent = '—';
+    }
+  });
+}
+
+// Simulate progress: advance to next step every 4 seconds
+setInterval(() => {
+  if (currentStep < signSteps.length - 1) {
+    currentStep++;
+    advanceSigning();
+  } else {
+    // Reset after completing all steps
+    setTimeout(() => {
+      currentStep = 0;
+      advanceSigning();
+    }, 2000);
+  }
+}, 4000);
+advanceSigning();
+</script>
+</body>
+</html>

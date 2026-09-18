@@ -108,6 +108,8 @@ class LiveTrader:
         self.pending_swaps: dict[str, PendingSwap] = {}
         self.submitted_swaps: dict[str, dict] = {}
         self.failed_swaps: dict[str, dict] = {}
+        self._max_history = 50
+        self._pending_swap_timeout = 300  # 5 minutes — swaps older than this are dropped
         self.buys_triggered = 0
         self.sells_triggered = 0
         self.errors: list[dict[str, Any]] = []
@@ -146,7 +148,7 @@ class LiveTrader:
     def _okx_build(self, ticker: str, okx_side: str, usd: float, note: str) -> PendingSwap | None:
         inst_id = self._resolve_okx_inst(ticker)
         if not inst_id:
-            self._log(f"[LIVE] SKIP OKX {okx_side} {ticker}: no OKX instId")
+            self._log(f"[LIVE] SKIP OKX {okx_side} {ticker!r}: no OKX instId (map_size={len(self.ticker_inst_map)}, map_keys_sample={list(self.ticker_inst_map.keys())[:5]})")
             return None
         if usd < 1.0:
             self._log(f"[LIVE] SKIP OKX {okx_side} {ticker}: stake too small ({usd:.2f} USD)")
@@ -154,6 +156,10 @@ class LiveTrader:
         try:
             quote = self.executor.get_quote(inst_id, side=okx_side, size_usd=usd)
             order = self.executor.build_order(quote, cl_ord_id=f"rh_{ticker}_{okx_side}_{int(time.time())}")
+        except ValueError as e:
+            # Order below minimum — log and skip (don't add to pending)
+            self._log(f"[LIVE] SKIP OKX {okx_side} {ticker}: {e}")
+            return None
         except Exception as e:
             self._log(f"[LIVE] ERROR OKX {okx_side.upper()} {ticker}: {e}")
             self.errors.append({"platform": "okx", "side": okx_side.upper(), "ticker": ticker, "error": str(e)})
@@ -232,16 +238,39 @@ class LiveTrader:
     # ── Resolvers ──────────────────────────────────────────────────
 
     def _resolve_okx_inst(self, ticker: str) -> str | None:
-        """Return OKX instId only if ticker is explicitly mapped.
+        """Return OKX instId for a ticker.
 
-        No fallback — unknown tickers (e.g. DexScreener memecoins not on
-        OKX) must return None so the caller SKIPs them instead of
-        constructing a fake `SOLFONE-USDT` that 404s.
+        Lookup order:
+          1. Exact match in ticker_inst_map (e.g. "SOL" -> "SOL-USDT")
+          2. Fallback: if ticker already looks like OKX instId (contains '-'),
+             return it directly (e.g. "SOL-USDT" stays "SOL-USDT")
+          3. Try appending "-USDT" as a heuristic — ONLY when map is populated
+             from OKX live data (non-default map), trust the heuristic.
+          4. Return None for unknown tickers not on OKX.
         """
+        # 1. Map lookup (covers both DEFAULT_OKX_INST_MAP and live-updated entries)
         for t in (ticker, ticker.upper(), ticker.lower()):
             if t in self.ticker_inst_map:
                 return self.ticker_inst_map[t]
-        return None  # not on OKX — SKIP silently
+        # 2. Already OKX instId format (contains '-')
+        if "-" in ticker:
+            return ticker.upper()
+        # 3. Heuristic: try -USDT append.
+        #    When the map has more than just the default entries, trust the heuristic
+        #    because OKX live data has already populated the map with real pairs.
+        upper = ticker.upper()
+        okx_guess = f"{upper}-USDT"
+        # Trust if map was extended beyond defaults (i.e. live data loaded)
+        if len(self.ticker_inst_map) > len(DEFAULT_OKX_INST_MAP):
+            return okx_guess
+        # Fallback: only trust well-known base currencies when map is default-only
+        well_known = {"BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "ADA",
+                      "AVAX", "LINK", "DOT", "MATIC", "UNI", "LTC",
+                      "ARB", "OP", "APT", "SUI", "TIA", "SEI", "WLD",
+                      "NEAR", "TRX"}
+        if upper in well_known:
+            return okx_guess
+        return None  # unknown — SKIP silently
 
     def _resolve_mint(self, ticker: str, resolve_mint_fn) -> str | None:
         for t in (ticker, ticker.upper(), ticker.lower()):
@@ -274,6 +303,43 @@ class LiveTrader:
 
     # ── Submit (platform-aware) ────────────────────────────────────
 
+    def build_swap(self, swap_key: str, ticker: str, side: str,
+                   amount_usd: float, inst_id: str) -> PendingSwap | None:
+        """Build a pending swap without adding to pending_swaps (for external engines)."""
+        okx_side = "buy" if side.upper() in ("BUY", "LONG") else "sell"
+        print(f"[LIVE_DEBUG] build_swap called: key={swap_key}, ticker={ticker}, side={side}, amount_usd={amount_usd}, inst_id={inst_id}")
+        print(f"[LIVE_DEBUG] executor type={type(self.executor).__name__}, auth_ready={getattr(self.executor, '_auth_ready', 'N/A')}")
+        try:
+            print(f"[LIVE_DEBUG] Calling get_quote for {inst_id} {okx_side} ${amount_usd}")
+            quote = self.executor.get_quote(inst_id, side=okx_side, size_usd=amount_usd)
+            print(f"[LIVE_DEBUG] get_quote OK: price=${quote.price_usd:.6f} size={quote.size_base:.6f}")
+            # P0-2: slippage guard — skip order if price impact is too high
+            slippage_pct = getattr(quote, 'price_impact_pct', 0.0)
+            SLIPPAGE_LIMIT_PCT = 1.5  # hard reject orders with >1.5% estimated slippage
+            if slippage_pct > SLIPPAGE_LIMIT_PCT:
+                print(f"[LIVE_DEBUG] REJECT {ticker}: slippage {slippage_pct:.2f}% > {SLIPPAGE_LIMIT_PCT}% limit")
+                self._log(f"[LIVE] SKIP {ticker}: slippage {slippage_pct:.2f}% exceeds {SLIPPAGE_LIMIT_PCT}% limit")
+                return None
+            order = self.executor.build_order(quote, cl_ord_id=f"{swap_key}")
+            print(f"[LIVE_DEBUG] build_order OK")
+        except ValueError as e:
+            print(f"[LIVE_DEBUG] SKIP OKX {okx_side} {ticker}: {e}")
+            self._log(f"[LIVE] SKIP OKX {okx_side} {ticker}: {e}")
+            return None
+        except Exception as e:
+            print(f"[LIVE_DEBUG] ERROR OKX {okx_side.upper()} {ticker}: {e}")
+            import traceback; traceback.print_exc()
+            self._log(f"[LIVE] ERROR OKX {okx_side.upper()} {ticker}: {e}")
+            return None
+        pending = PendingSwap(
+            ticker=ticker, side=side.upper(), platform="okx",
+            amount_usd=amount_usd, quote=quote, bundle=None, okx_order=order,
+            inst_id=inst_id, fee_amount_usd=quote.fee_amount_usd,
+            created_at=time.time(), note=side, requires_wallet_sign=False,
+        )
+        print(f"[LIVE_DEBUG] PendingSwap created for {ticker} {side}")
+        return pending
+
     def submit_swap(self, swap_key: str, signed_payload: str | None = None) -> dict:
         ps = self.pending_swaps.get(swap_key)
         if not ps:
@@ -292,6 +358,7 @@ class LiveTrader:
             result = self.executor.submit_order(ps.okx_order)
             self.submitted_swaps[swap_key] = {
                 "platform": "okx",
+                "ticker": ps.ticker,
                 "order_id": result.get("order_id", ""),
                 "inst_id": result.get("inst_id", ps.inst_id),
                 "side": ps.side,
@@ -301,19 +368,30 @@ class LiveTrader:
                 "timestamp": time.time(),
             }
             del self.pending_swaps[swap_key]
+            self._trim_history()
             self._log(f"[LIVE] OKX SUBMITTED {ps.side} {ps.ticker}: orderId={result.get('order_id','?')}")
-            return {"ok": True, "order_id": result.get("order_id", ""), "platform": "okx"}
+            return {"ok": True, "order_id": result.get("order_id", ""), "platform": "okx", "ticker": ps.ticker}
         except Exception as e:
-            self.failed_swaps[swap_key] = {"platform": "okx", "error": str(e), "timestamp": time.time()}
-            return {"ok": False, "error": str(e), "platform": "okx"}
+            self.failed_swaps[swap_key] = {"platform": "okx", "ticker": ps.ticker, "side": ps.side, "amount_usd": ps.amount_usd, "error": str(e), "timestamp": time.time()}
+            del self.pending_swaps[swap_key]
+            self._trim_history()
+            return {"ok": False, "error": str(e), "platform": "okx", "ticker": ps.ticker}
 
     def _submit_jupiter(self, swap_key: str, ps: PendingSwap, signed_payload: str | None) -> dict:
         import urllib.request as _ur
         tx_b64 = signed_payload if signed_payload else getattr(ps.bundle, "transaction_base64", None)
         if not tx_b64:
             return {"ok": False, "error": "empty transaction bundle"}
-        if not signed_payload:
-            return {"ok": False, "error": "transaction not signed — use Phantom wallet Sign & Submit"}
+
+        # P2-8: server-side signing — if executor has a private key, sign automatically
+        if not signed_payload and hasattr(self.executor, "server_signing_ready") and self.executor.server_signing_ready:
+            try:
+                tx_b64 = self.executor.sign_transaction(tx_b64)
+            except Exception as e:
+                return {"ok": False, "error": f"server sign failed: {e}", "platform": "jupiter"}
+
+        if not signed_payload and not (hasattr(self.executor, "server_signing_ready") and self.executor.server_signing_ready):
+            return {"ok": False, "error": "transaction not signed — use Phantom wallet Sign & Submit or set RH_JUPITER_PRIVATE_KEY"}
 
         try:
             payload = json.dumps({
@@ -335,13 +413,36 @@ class LiveTrader:
                 "fee_usd": ps.fee_amount_usd, "timestamp": time.time(),
             }
             del self.pending_swaps[swap_key]
+            self._trim_history()
             self._log(f"[LIVE] JUPITER SUBMITTED {ps.side} {ps.ticker}: sig={sig[:20]}...")
             return {"ok": True, "sig": sig, "platform": "jupiter"}
         except Exception as e:
-            self.failed_swaps[swap_key] = {"platform": "jupiter", "error": str(e), "timestamp": time.time()}
-            return {"ok": False, "error": str(e), "platform": "jupiter"}
+            self.failed_swaps[swap_key] = {"platform": "jupiter", "ticker": ps.ticker, "side": ps.side, "amount_usd": ps.amount_usd, "error": str(e), "timestamp": time.time()}
+            del self.pending_swaps[swap_key]
+            self._trim_history()
+            return {"ok": False, "error": str(e), "platform": "jupiter", "ticker": ps.ticker}
 
     # ── Dashboard outputs ─────────────────────────────────────────
+
+    def _trim_history(self) -> None:
+        """Keep only the most recent N entries in submitted/failed to prevent unbounded growth."""
+        if len(self.submitted_swaps) > self._max_history:
+            sorted_keys = sorted(self.submitted_swaps, key=lambda k: self.submitted_swaps[k].get("timestamp", 0), reverse=True)
+            for k in sorted_keys[self._max_history:]:
+                del self.submitted_swaps[k]
+        if len(self.failed_swaps) > self._max_history:
+            sorted_keys = sorted(self.failed_swaps, key=lambda k: self.failed_swaps[k].get("timestamp", 0), reverse=True)
+            for k in sorted_keys[self._max_history:]:
+                del self.failed_swaps[k]
+
+    def _cleanup_expired_swaps(self) -> None:
+        """Remove pending swaps older than _pending_swap_timeout seconds."""
+        now = time.time()
+        expired = [(k, v.created_at) for k, v in self.pending_swaps.items()
+                   if now - v.created_at > self._pending_swap_timeout]
+        for k, created_at in expired:
+            del self.pending_swaps[k]
+            print(f"[Trader] Cleaned up expired pending swap: {k} (age={now - created_at:.0f}s)")
 
     def status(self) -> dict[str, Any]:
         return {
@@ -362,7 +463,9 @@ class LiveTrader:
 
     def swaps_snapshot(self) -> list[dict]:
         out = []
-        for key, ps in self.pending_swaps.items():
+        # Cap pending to most recent 100 to prevent massive payload
+        pending_items = list(self.pending_swaps.items())[-100:]
+        for key, ps in pending_items:
             entry = {
                 "key": key, "ticker": ps.ticker, "side": ps.side,
                 "platform": ps.platform, "inst_id": ps.inst_id,

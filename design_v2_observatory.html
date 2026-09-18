@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RB2 Jupiter — Observatory</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,300;0,400;0,600;1,400&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #f5f0eb;
+  --bg2: #eee8e0;
+  --paper: #fffdf9;
+  --ink: #1a1614;
+  --ink-mid: #4a3f36;
+  --ink-dim: #8a7e74;
+  --accent: #c0392b;
+  --accent2: #1a6b4a;
+  --gold: #b8860b;
+  --blue: #2c5f8a;
+  --border: #d4c8b8;
+  --shadow: 0 1px 3px rgba(26,22,20,0.06), 0 8px 24px rgba(26,22,20,0.04);
+  --shadow-lg: 0 4px 12px rgba(26,22,20,0.08), 0 16px 48px rgba(26,22,20,0.06);
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: 'Outfit', sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+/* ── Paper texture overlay ── */
+body::before {
+  content:'';
+  position:fixed; inset:0; pointer-events:none; z-index:9999;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+  opacity: 0.4;
+}
+
+/* ── Header ── */
+header {
+  padding: 40px 48px 32px;
+  border-bottom: 1px solid var(--border);
+  background: var(--paper);
+  position: relative;
+}
+header::after {
+  content:'';
+  position:absolute; bottom:-1px; left:48px; right:48px; height:1px;
+  background: linear-gradient(90deg, var(--accent), var(--gold), var(--accent2));
+}
+.header-top {
+  display:flex; align-items:flex-start; justify-content:space-between;
+  margin-bottom:24px;
+}
+.brand {}
+.brand-name {
+  font-family: 'Crimson Pro', serif;
+  font-size: 32px;
+  font-weight: 300;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+}
+.brand-name em { font-style:italic; color:var(--accent); }
+.brand-sub {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--ink-dim);
+  margin-top: 2px;
+}
+.header-meta {
+  text-align: right;
+  font-family: 'Crimson Pro', serif;
+}
+.header-date {
+  font-size: 14px;
+  font-style: italic;
+  color: var(--ink-mid);
+}
+.header-status {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--accent2);
+  margin-top: 4px;
+  display: flex; align-items:center; justify-content:flex-end; gap:6px;
+}
+.header-status::before {
+  content:'';
+  width:6px; height:6px; border-radius:50%;
+  background:var(--accent2);
+  animation: pulse 2s infinite;
+}
+@keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.5;transform:scale(0.85)} }
+
+/* ── Hero metrics ── */
+.hero {
+  display: grid;
+  grid-template-columns: 1fr 2fr 1fr;
+  gap: 1px;
+  background: var(--border);
+  margin: 0 48px;
+  border: 1px solid var(--border);
+  border-top: none;
+}
+.hero-block {
+  background: var(--paper);
+  padding: 28px 32px;
+  position: relative;
+}
+.hero-block::before {
+  content: attr(data-label);
+  position: absolute;
+  top: 0; left: 0;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--ink-dim);
+  background: var(--paper);
+  padding: 6px 12px;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+.hero-num {
+  font-family: 'Crimson Pro', serif;
+  font-size: 48px;
+  font-weight: 300;
+  line-height: 1;
+  color: var(--ink);
+  margin-top: 8px;
+}
+.hero-num.up { color: var(--accent2); }
+.hero-num.down { color: var(--accent); }
+.hero-change {
+  font-size: 12px;
+  color: var(--ink-dim);
+  margin-top: 6px;
+  font-style: italic;
+  font-family: 'Crimson Pro', serif;
+}
+.hero-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--ink-dim);
+  margin-top: 12px;
+}
+
+/* ── Main layout ── */
+.main {
+  padding: 32px 48px;
+  display: grid;
+  grid-template-columns: 1fr 340px;
+  gap: 32px;
+  align-items: start;
+}
+
+/* ── Card ── */
+.card {
+  background: var(--paper);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  margin-bottom: 24px;
+  position: relative;
+}
+.card-accent {
+  position: absolute; top:0; left:0; right:0; height:2px;
+}
+.card-accent.red { background: var(--accent); }
+.card-accent.green { background: var(--accent2); }
+.card-accent.gold { background: var(--gold); }
+.card-accent.blue { background: var(--blue); }
+.card-header {
+  padding: 20px 24px 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items:center; justify-content: space-between;
+}
+.card-title {
+  font-family: 'Crimson Pro', serif;
+  font-size: 18px;
+  font-weight: 400;
+  font-style: italic;
+  color: var(--ink);
+}
+.card-body { padding: 20px 24px; }
+.card-footer {
+  padding: 12px 24px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--ink-dim);
+  font-style: italic;
+  font-family: 'Crimson Pro', serif;
+  display:flex; justify-content:space-between;
+}
+
+/* ── Chart area ── */
+.chart-container {
+  position: relative;
+  height: 240px;
+  margin: 8px 0;
+}
+.chart-container canvas { width:100%; height:100%; }
+
+/* ── Table ── */
+.doc-table { width:100%; border-collapse:collapse; }
+.doc-table th {
+  text-align: left;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--ink-dim);
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-weight: 400;
+}
+.doc-table td {
+  padding: 12px 0;
+  border-bottom: 1px solid rgba(212,200,184,0.5);
+  vertical-align: middle;
+  font-size: 13px;
+}
+.doc-table tr:last-child td { border-bottom: none; }
+.doc-table .ticker {
+  font-family: 'Crimson Pro', serif;
+  font-size: 15px;
+  font-weight: 600;
+}
+.pnl-pos { color: var(--accent2); font-weight:500; }
+.pnl-neg { color: var(--accent); font-weight:500; }
+
+/* ── Sidebar card ── */
+.sidebar .card { margin-bottom: 16px; }
+.sidebar .card-body { padding: 16px 20px; }
+
+/* ── Feed ── */
+.feed-item {
+  display: flex; gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(212,200,184,0.5);
+  font-size: 12px;
+}
+.feed-item:last-child { border-bottom: none; }
+.feed-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  margin-top: 6px; flex-shrink: 0;
+}
+.feed-dot.buy { background: var(--accent2); }
+.feed-dot.sell { background: var(--accent); }
+.feed-dot.info { background: var(--blue); }
+.feed-time { color: var(--ink-dim); font-size: 10px; font-style: italic; font-family:'Crimson Pro',serif; white-space:nowrap; }
+.feed-text { flex:1; }
+.feed-text strong { color:var(--ink); font-weight:600; }
+.feed-note { color:var(--ink-dim); font-size:11px; margin-top:2px; font-style:italic; }
+
+/* ── Kelly meter ── */
+.kelly-section { margin-bottom: 16px; }
+.kelly-label {
+  display:flex; justify-content:space-between;
+  font-size: 10px; text-transform:uppercase; letter-spacing:0.1em;
+  color:var(--ink-dim); margin-bottom:6px;
+}
+.kelly-bar {
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.kelly-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.8s ease;
+}
+.kelly-row {
+  display:flex; justify-content:space-between;
+  padding:8px 0;
+  border-bottom:1px solid rgba(212,200,184,0.4);
+  font-size:12px;
+}
+.kelly-row:last-child { border-bottom:none; }
+.kelly-key { color:var(--ink-dim); font-style:italic; font-family:'Crimson Pro',serif; }
+.kelly-val { font-weight:500; }
+
+/* ── Decision item ── */
+.decision-item {
+  padding: 12px 0;
+  border-bottom: 1px solid rgba(212,200,184,0.4);
+}
+.decision-item:last-child { border-bottom:none; }
+.decision-top {
+  display:flex; align-items:center; gap:8px; margin-bottom:4px;
+}
+.decision-ticker {
+  font-family:'Crimson Pro',serif; font-size:15px; font-weight:600;
+}
+.decision-badge {
+  font-size:9px; padding:1px 6px;
+  border:1px solid var(--border);
+  color:var(--ink-dim);
+  text-transform:uppercase; letter-spacing:0.1em;
+}
+.decision-reason {
+  font-size:11px; color:var(--ink-dim);
+  font-style:italic; font-family:'Crimson Pro',serif;
+  line-height:1.5;
+}
+
+/* ── Decorative divider ── */
+.divider {
+  display:flex; align-items:center; gap:12px;
+  margin:24px 0;
+  color:var(--ink-dim);
+  font-size:10px;
+  text-transform:uppercase;
+  letter-spacing:0.2em;
+}
+.divider::before, .divider::after {
+  content:''; flex:1; height:1px; background:var(--border);
+}
+
+/* ── Small tags ── */
+.tag {
+  display:inline-block;
+  font-size:9px; padding:2px 8px;
+  border:1px solid var(--border);
+  color:var(--ink-dim);
+  text-transform:uppercase; letter-spacing:0.08em;
+}
+
+/* ── Responsive ── */
+@media(max-width:1100px) {
+  .main { grid-template-columns:1fr; }
+  .hero { grid-template-columns:repeat(3,1fr); }
+}
+@media(max-width:700px) {
+  header, .main { padding:20px; }
+  .hero { margin:0 20px; grid-template-columns:1fr; }
+  .hero-num { font-size:36px; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-top">
+    <div class="brand">
+      <div class="brand-name">RB2 <em>Jupiter</em></div>
+      <div class="brand-sub">Quantitative Trading Observatory · Strategy Monitor</div>
+    </div>
+    <div class="header-meta">
+      <div class="header-date">Thursday, September 11, 2025</div>
+      <div class="header-status">Live Monitoring · Demo Mode</div>
+    </div>
+  </div>
+</header>
+
+<div class="hero">
+  <div class="hero-block" data-label="Total Equity">
+    <div class="hero-num up">$128,492</div>
+    <div class="hero-change">↑ from $100,000 starting capital</div>
+    <div class="hero-label">Bankroll</div>
+  </div>
+  <div class="hero-block" data-label="Daily Performance">
+    <div class="hero-num up">+$4,218</div>
+    <div class="hero-change">+3.40% today · 12 wins, 7 losses</div>
+    <div class="hero-label">PnL · Win Rate 63% · Sharpe 1.82</div>
+  </div>
+  <div class="hero-block" data-label="Kelly Fraction">
+    <div class="hero-num">0.085</div>
+    <div class="hero-change">Vol penalty: 0.30 · ATR: 8.2%</div>
+    <div class="hero-label">Position Sizing · Conservative Mode</div>
+  </div>
+</div>
+
+<div class="main">
+  <!-- Left column -->
+  <div class="left">
+
+    <!-- Equity Chart -->
+    <div class="card">
+      <div class="card-accent green"></div>
+      <div class="card-header">
+        <div class="card-title">Equity Trajectory</div>
+        <div style="display:flex;gap:16px;font-size:10px;color:var(--ink-dim);text-transform:uppercase;letter-spacing:0.1em">
+          <span style="color:var(--accent2)">● Equity</span>
+          <span style="color:var(--ink-dim)">— Benchmark</span>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="chart-container">
+          <canvas id="equityChart"></canvas>
+        </div>
+      </div>
+      <div class="card-footer">
+        <span>Last 7 days · Hourly samples</span>
+        <span>Peak: $134,201 · Trough: $96,840</span>
+      </div>
+    </div>
+
+    <!-- Positions -->
+    <div class="card">
+      <div class="card-accent blue"></div>
+      <div class="card-header">
+        <div class="card-title">Active Positions</div>
+        <span style="font-size:11px;color:var(--ink-dim);font-style:italic;font-family:'Crimson Pro',serif">3 open · Notional $8,420</span>
+      </div>
+      <div class="card-body" style="padding:0">
+        <table class="doc-table">
+          <thead>
+            <tr><th>Asset</th><th>Side</th><th>Entry</th><th>Mark</th><th>PnL</th><th>Mult</th><th>Strategy</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="ticker">WIF/USDT</span></td>
+              <td><span class="tag" style="border-color:rgba(26,107,74,0.3);color:var(--accent2)">Long</span></td>
+              <td>$1.842</td>
+              <td>$1.901</td>
+              <td class="pnl-pos">+$234</td>
+              <td style="color:var(--accent2)">1.03x</td>
+              <td style="font-style:italic;color:var(--ink-dim);font-size:11px">Narrative + ATR exit</td>
+            </tr>
+            <tr>
+              <td><span class="ticker">PEPE/USDT</span></td>
+              <td><span class="tag" style="border-color:rgba(26,107,74,0.3);color:var(--accent2)">Long</span></td>
+              <td>$0.00721</td>
+              <td>$0.00718</td>
+              <td class="pnl-neg">-$52</td>
+              <td style="color:var(--accent)">0.99x</td>
+              <td style="font-style:italic;color:var(--ink-dim);font-size:11px">Holder cluster signal</td>
+            </tr>
+            <tr>
+              <td><span class="ticker">DOGE/USDT</span></td>
+              <td><span class="tag" style="border-color:rgba(192,57,43,0.3);color:var(--accent)">Short</span></td>
+              <td>$0.1842</td>
+              <td>$0.1819</td>
+              <td class="pnl-pos">+$118</td>
+              <td style="color:var(--accent2)">1.01x</td>
+              <td style="font-style:italic;color:var(--ink-dim);font-size:11px">Mean reversion</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card-footer">
+        <span>Exit conditions: TP=2.0x · SL=0.85x · Time=24h</span>
+        <span>Updated 14:32 UTC</span>
+      </div>
+    </div>
+
+    <!-- Trade History -->
+    <div class="card">
+      <div class="card-accent gold"></div>
+      <div class="card-header">
+        <div class="card-title">Recent Transactions</div>
+        <span style="font-size:10px;color:var(--ink-dim);text-transform:uppercase;letter-spacing:0.1em">Export → CSV</span>
+      </div>
+      <div class="card-body" style="padding:0">
+        <table class="doc-table">
+          <thead>
+            <tr><th>Asset</th><th>Direction</th><th>PnL</th><th>Return</th><th>Exit Reason</th><th>Date</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="ticker">BONK</span></td>
+              <td style="color:var(--accent2)">Sold</td>
+              <td class="pnl-pos">+$810</td>
+              <td style="color:var(--accent2)">+214%</td>
+              <td style="font-style:italic;color:var(--ink-dim);font-size:11px">Take Profit</td>
+              <td style="color:var(--ink-dim);font-size:11px">Sep 11, 14:28</td>
+            </tr>
+            <tr>
+              <td><span class="ticker">FLOKI</span></td>
+              <td style="color:var(--accent2)">Sold</td>
+              <td class="pnl-pos">+$294</td>
+              <td style="color:var(--accent2)">+131%</td>
+              <td style="font-style:italic;color:var(--ink-dim);font-size:11px">Time Limit</td>
+              <td style="color:var(--ink-dim);font-size:11px">Sep 11, 13:20</td>
+            </tr>
+            <tr>
+              <td><span class="ticker">SHIB</span></td>
+              <td style="color:var(--accent)">Sold</td>
+              <td class="pnl-neg">-$117</td>
+              <td style="color:var(--accent)">-13%</td>
+              <td style="font-style:italic;color:var(--ink-dim);font-size:11px">Stop Loss</td>
+              <td style="color:var(--ink-dim);font-size:11px">Sep 11, 13:58</td>
+            </tr>
+            <tr>
+              <td><span class="ticker">SOL</span></td>
+              <td style="color:var(--accent2)">Sold</td>
+              <td class="pnl-pos">+$1,204</td>
+              <td style="color:var(--accent2)">+187%</td>
+              <td style="font-style:italic;color:var(--ink-dim);font-size:11px">Take Profit</td>
+              <td style="color:var(--ink-dim);font-size:11px">Sep 10, 10:15</td>
+            </tr>
+            <tr>
+              <td><span class="ticker">LINK</span></td>
+              <td style="color:var(--accent2)">Sold</td>
+              <td class="pnl-pos">+$432</td>
+              <td style="color:var(--accent2)">+76%</td>
+              <td style="font-style:italic;color:var(--ink-dim);font-size:11px">Take Profit</td>
+              <td style="color:var(--ink-dim);font-size:11px">Sep 10, 12:45</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card-footer">
+        <span>147 closed trades · Total PnL: +$28,492</span>
+        <span>Avg hold: 4.2h</span>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Right sidebar -->
+  <div class="sidebar">
+
+    <!-- Kelly Panel -->
+    <div class="card">
+      <div class="card-accent red"></div>
+      <div class="card-header">
+        <div class="card-title">Kelly Criterion</div>
+      </div>
+      <div class="card-body">
+        <div class="kelly-section">
+          <div class="kelly-label"><span>Win Rate (raw)</span><span style="color:var(--accent2)">62.3%</span></div>
+          <div class="kelly-bar"><div class="kelly-fill" style="width:62.3%;background:var(--accent2)"></div></div>
+        </div>
+        <div class="kelly-section">
+          <div class="kelly-label"><span>Win Rate (decayed)</span><span>58.1%</span></div>
+          <div class="kelly-bar"><div class="kelly-fill" style="width:58.1%;background:var(--blue)"></div></div>
+        </div>
+        <div class="kelly-section">
+          <div class="kelly-label"><span>Position Sizing</span><span style="color:var(--gold)">0.085 (8.5%)</span></div>
+          <div class="kelly-bar"><div class="kelly-fill" style="width:56%;background:var(--gold)"></div></div>
+        </div>
+
+        <div style="margin-top:16px">
+          <div class="kelly-row"><span class="kelly-key">Full Kelly</span><span class="kelly-val">0.247</span></div>
+          <div class="kelly-row"><span class="kelly-key">Vol Penalty (ATR)</span><span class="kelly-val" style="color:var(--gold)">0.300</span></div>
+          <div class="kelly-row"><span class="kelly-key">Avg Win Mult</span><span class="kelly-val" style="color:var(--accent2)">2.14x</span></div>
+          <div class="kelly-row"><span class="kelly-key">Avg Loss Mult</span><span class="kelly-val" style="color:var(--accent)">0.87x</span></div>
+          <div class="kelly-row"><span class="kelly-key">Expectancy</span><span class="kelly-val" style="color:var(--accent2)">+0.891</span></div>
+          <div class="kelly-row"><span class="kelly-key">Trades in window</span><span class="kelly-val">147</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Signal Feed -->
+    <div class="card">
+      <div class="card-accent green"></div>
+      <div class="card-header">
+        <div class="card-title">Signal Feed</div>
+        <span style="font-size:10px;color:var(--ink-dim)">Live</span>
+      </div>
+      <div class="card-body">
+        <div class="feed-item">
+          <div class="feed-dot buy"></div>
+          <div>
+            <div class="feed-time">14:32:08 UTC</div>
+            <div class="feed-text"><strong>BUY PEPE/USDT</strong> · $2,400</div>
+            <div class="feed-note">narrative=0.81 · holder_concentrated · kelly=0.085</div>
+          </div>
+        </div>
+        <div class="feed-item">
+          <div class="feed-dot sell"></div>
+          <div>
+            <div class="feed-time">14:28:41 UTC</div>
+            <div class="feed-text"><strong>SELL BONK/USDT</strong> · Take Profit</div>
+            <div class="feed-note">mult=2.14x · pnl=+$810</div>
+          </div>
+        </div>
+        <div class="feed-item">
+          <div class="feed-dot buy"></div>
+          <div>
+            <div class="feed-time">14:15:22 UTC</div>
+            <div class="feed-text"><strong>BUY WIF/USDT</strong> · $3,200</div>
+            <div class="feed-note">atr_penalty=0.30 · liq_growth=1.18</div>
+          </div>
+        </div>
+        <div class="feed-item">
+          <div class="feed-dot sell"></div>
+          <div>
+            <div class="feed-time">13:58:10 UTC</div>
+            <div class="feed-text"><strong>SELL SHIB/USDT</strong> · Stop Loss</div>
+            <div class="feed-note">mult=0.87x · pnl=-$117</div>
+          </div>
+        </div>
+        <div class="feed-item">
+          <div class="feed-dot info"></div>
+          <div>
+            <div class="feed-time">13:45:00 UTC</div>
+            <div class="feed-text"><strong>Kelly recalculation</strong></div>
+            <div class="feed-note">win_rate updated · half_life=5 trades</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Builder Code -->
+    <div class="card">
+      <div class="card-accent gold"></div>
+      <div class="card-header">
+        <div class="card-title">Builder Code</div>
+      </div>
+      <div class="card-body">
+        <div class="kelly-row"><span class="kelly-key">Code</span><span class="kelly-val" style="font-family:monospace;color:var(--gold)">RB2-JUPITER</span></div>
+        <div class="kelly-row"><span class="kelly-key">Commission Returned</span><span class="kelly-val pnl-pos">+$128.40</span></div>
+        <div class="kelly-row"><span class="kelly-key">Today's Commission</span><span class="kelly-val pnl-pos">+$18.20</span></div>
+        <div class="kelly-row"><span class="kelly-key">Attributed Trades</span><span class="kelly-val">47</span></div>
+      </div>
+    </div>
+
+    <!-- AI Decisions -->
+    <div class="card">
+      <div class="card-accent blue"></div>
+      <div class="card-header">
+        <div class="card-title">AI Decisions</div>
+      </div>
+      <div class="card-body">
+        <div class="decision-item">
+          <div class="decision-top">
+            <span class="decision-ticker">PEPE/USDT</span>
+            <span class="decision-badge">Buy · Spot</span>
+          </div>
+          <div class="decision-reason">Strong narrative score. Holder concentration detected. Liquidity growth accelerating at 1.18x.</div>
+        </div>
+        <div class="decision-item">
+          <div class="decision-top">
+            <span class="decision-ticker">BONK/USDT</span>
+            <span class="decision-badge">Sell · TP</span>
+          </div>
+          <div class="decision-reason">Target multiple 2.0x reached. Trailing stop active. Locking in gains.</div>
+        </div>
+        <div class="decision-item">
+          <div class="decision-top">
+            <span class="decision-ticker">SHIB/USDT</span>
+            <span class="decision-badge">Sell · SL</span>
+          </div>
+          <div class="decision-reason">Multiplier dropped to 0.87x below stop threshold. ATR trigger activated.</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('equityChart');
+const ctx = canvas.getContext('2d');
+
+function resize() {
+  const rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width = rect.width * 2;
+  canvas.height = rect.height * 2;
+  ctx.scale(2, 2);
+  canvas.style.width = rect.width + 'px';
+  canvas.style.height = rect.height + 'px';
+}
+resize();
+window.addEventListener('resize', () => { resize(); draw(); });
+
+function generateData(n, start, vol) {
+  const d = [start];
+  for (let i = 1; i < n; i++) {
+    const drift = 0.0004;
+    const shock = (Math.random() - 0.47) * vol;
+    d.push(d[i-1] * (1 + drift + shock));
+  }
+  return d;
+}
+
+const equity = generateData(168, 100000, 0.006);
+const bench = Array.from({length:168}, (_, i) => 100000 * (1 + i * 0.00015));
+const peak = Math.max(...equity, ...bench);
+const trough = Math.min(...equity, ...bench);
+
+function draw() {
+  const W = parseFloat(canvas.style.width);
+  const H = parseFloat(canvas.style.height);
+  ctx.clearRect(0, 0, W, H);
+
+  const pad = { t:16, b:24, l:8, r:8 };
+  const cw = W - pad.l - pad.r;
+  const ch = H - pad.t - pad.b;
+  const range = peak - trough || 1;
+
+  function point(data, i) {
+    return {
+      x: pad.l + (i / (data.length-1)) * cw,
+      y: pad.t + (1 - (data[i] - trough) / range) * ch
+    };
+  }
+
+  // Grid
+  ctx.strokeStyle = 'rgba(212,200,184,0.6)';
+  ctx.lineWidth = 0.5;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + (i/4) * ch;
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l+cw, y); ctx.stroke();
+  }
+
+  // Benchmark line
+  ctx.beginPath();
+  for (let i = 0; i < bench.length; i++) {
+    const p = point(bench, i);
+    i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y);
+  }
+  ctx.strokeStyle = 'rgba(138,126,116,0.4)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4,4]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Equity fill
+  const grad = ctx.createLinearGradient(0, pad.t, 0, H - pad.b);
+  grad.addColorStop(0, 'rgba(26,107,74,0.1)');
+  grad.addColorStop(1, 'rgba(26,107,74,0)');
+  ctx.beginPath();
+  ctx.moveTo(point(equity,0).x, H - pad.b);
+  for (let i = 0; i < equity.length; i++) {
+    const p = point(equity, i);
+    ctx.lineTo(p.x, p.y);
+  }
+  ctx.lineTo(point(equity, equity.length-1).x, H - pad.b);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Equity line
+  ctx.beginPath();
+  for (let i = 0; i < equity.length; i++) {
+    const p = point(equity, i);
+    i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y);
+  }
+  ctx.strokeStyle = '#1a6b4a';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // End dot
+  const ep = point(equity, equity.length-1);
+  ctx.beginPath(); ctx.arc(ep.x, ep.y, 4, 0, Math.PI*2);
+  ctx.fillStyle = '#1a6b4a'; ctx.fill();
+  ctx.beginPath(); ctx.arc(ep.x, ep.y, 7, 0, Math.PI*2);
+  ctx.strokeStyle = 'rgba(26,107,74,0.25)'; ctx.lineWidth=1; ctx.stroke();
+
+  // Value label
+  ctx.fillStyle = '#1a1614';
+  ctx.font = '500 11px Outfit';
+  ctx.textAlign = 'right';
+  ctx.fillText('$' + equity[equity.length-1].toLocaleString(undefined,{maximumFractionDigits:0}), ep.x - 10, ep.y - 10);
+}
+draw();
+</script>
+</body>
+</html>

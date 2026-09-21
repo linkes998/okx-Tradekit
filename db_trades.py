@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
-"""SQLite-based persistent trade storage for DeskRunner."""
+"""SQLite-based persistent trade storage for DeskRunner.
+
+Multi-tenant layout
+-------------------
+``user_id = 0``  → system default / shared desk data (the data the site shows
+                   before a member configures their own trade settings + API key).
+``user_id = N``  → data belonging to member N. Dashboard shows only this slice
+                   once that member has saved a complete set of API credentials.
+"""
 from __future__ import annotations
 import hashlib
-import json
 import secrets
 import sqlite3
 import threading
@@ -10,23 +17,57 @@ import time
 from pathlib import Path
 from typing import Any
 
+#: Rows owned by the shared/system desk (no member context).
+SYSTEM_UID = 0
+
 
 class TradeDB:
     """Thread-safe SQLite store for closed trades and open positions."""
+
+    #: How long a session validation result may be reused before re-querying.
+    SESSION_CACHE_TTL = 5.0
 
     def __init__(self, db_path: str = "trades.db"):
         self._path = Path(db_path)
         self._lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None
+        # token → (verified_at, info|None). Avoids a DB round-trip on every
+        # 1-second dashboard poll while still honouring logout/expiry.
+        self._sess_cache: dict[str, tuple[float, dict | None]] = {}
         self._init_db()
         self._init_members()
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
-            self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn = sqlite3.connect(
+                str(self._path), check_same_thread=False, timeout=15.0
+            )
+            conn = self._conn
+            # ── Performance tuning: this DB is written by the runner thread and
+            # read by many HTTP worker threads at 1 Hz per client.
+            conn.execute("PRAGMA journal_mode=WAL")        # concurrent readers + 1 writer
+            conn.execute("PRAGMA synchronous=NORMAL")      # WAL + NORMAL is crash-safe
+            conn.execute("PRAGMA cache_size=-16000")       # ~16 MB page cache
+            conn.execute("PRAGMA temp_store=MEMORY")       # keep sorts/aggregates off disk
+            conn.execute("PRAGMA mmap_size=268435456")     # 256 MB memory-mapped I/O
+            conn.execute("PRAGMA busy_timeout=15000")      # avoid SQLITE_BUSY under load
         return self._conn
+
+    # ── schema helpers ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+        try:
+            rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        except sqlite3.Error:
+            return set()
+        return {r[1] for r in rows}
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, col: str, decl: str) -> None:
+        """Idempotent ADD COLUMN (SQLite has no ADD COLUMN IF NOT EXISTS)."""
+        if col not in TradeDB._columns(conn, table):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
     def _init_db(self) -> None:
         conn = self._get_conn()
@@ -47,22 +88,57 @@ class TradeDB:
                 why         TEXT DEFAULT '',
                 platform    TEXT DEFAULT 'JUP',
                 order_id    TEXT DEFAULT '',
+                user_id     INTEGER NOT NULL DEFAULT 0,
                 created_at  REAL NOT NULL
             )
         """)
+        # Legacy DBs: add the tenancy column in place.
+        self._ensure_column(conn, "closed_trades", "user_id", "INTEGER NOT NULL DEFAULT 0")
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS open_trades (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker      TEXT UNIQUE NOT NULL,
+                ticker      TEXT NOT NULL,
                 side        TEXT NOT NULL DEFAULT 'BUY',
                 entry_usd   REAL NOT NULL,
                 entry_min   INTEGER,
                 entry_ts    REAL,
                 platform    TEXT DEFAULT 'JUP',
                 order_id    TEXT DEFAULT '',
-                created_at  REAL NOT NULL
+                user_id     INTEGER NOT NULL DEFAULT 0,
+                created_at  REAL NOT NULL,
+                UNIQUE(ticker, user_id)
             )
         """)
+        # Legacy `open_trades` had UNIQUE(ticker) at column level, which blocks
+        # two members from holding the same ticker. Rebuild once with the
+        # composite constraint, preserving all existing rows as system data.
+        if "user_id" not in self._columns(conn, "open_trades"):
+            conn.execute("ALTER TABLE open_trades RENAME TO open_trades_legacy")
+            conn.execute("""
+                CREATE TABLE open_trades (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker      TEXT NOT NULL,
+                    side        TEXT NOT NULL DEFAULT 'BUY',
+                    entry_usd   REAL NOT NULL,
+                    entry_min   INTEGER,
+                    entry_ts    REAL,
+                    platform    TEXT DEFAULT 'JUP',
+                    order_id    TEXT DEFAULT '',
+                    user_id     INTEGER NOT NULL DEFAULT 0,
+                    created_at  REAL NOT NULL,
+                    UNIQUE(ticker, user_id)
+                )
+            """)
+            conn.execute("""
+                INSERT INTO open_trades
+                    (id, ticker, side, entry_usd, entry_min, entry_ts, platform, order_id, user_id, created_at)
+                SELECT id, ticker, side, entry_usd, entry_min, entry_ts, platform, order_id, 0, created_at
+                FROM open_trades_legacy
+            """)
+            conn.execute("DROP TABLE open_trades_legacy")
+            print("[TradeDB] migrated open_trades → composite UNIQUE(ticker, user_id)")
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key     TEXT PRIMARY KEY,
@@ -70,12 +146,12 @@ class TradeDB:
                 updated_at  REAL NOT NULL
             )
         """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_closed_ticker ON closed_trades(ticker);
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_closed_ts ON closed_trades(exit_ts);
-        """)
+        # ── Indexes tuned for the hot read paths ──
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_closed_ticker ON closed_trades(ticker)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_closed_ts ON closed_trades(exit_ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_closed_user_id ON closed_trades(user_id, id DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_closed_user_win ON closed_trades(user_id, win)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_open_user ON open_trades(user_id)")
         conn.commit()
 
     # ── closed trades ──────────────────────────────────────────────────────
@@ -87,8 +163,9 @@ class TradeDB:
             cur = conn.execute(
                 """INSERT INTO closed_trades
                    (ticker, side, entry_usd, exit_usd, pnl_usd, pnl_mult, win,
-                    entry_min, exit_min, entry_ts, exit_ts, why, platform, order_id, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    entry_min, exit_min, entry_ts, exit_ts, why, platform, order_id,
+                    user_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     trade.get("ticker", ""),
                     trade.get("side", "EXIT"),
@@ -104,22 +181,26 @@ class TradeDB:
                     trade.get("why", ""),
                     trade.get("platform", "JUP"),
                     trade.get("order_id", ""),
+                    int(trade.get("user_id", SYSTEM_UID) or 0),
                     now,
                 ),
             )
             conn.commit()
             return cur.lastrowid
 
-    def get_recent(self, limit: int = 50, offset: int = 0) -> list[dict]:
+    def get_recent(self, limit: int = 50, offset: int = 0,
+                   user_id: int | None = SYSTEM_UID) -> list[dict]:
+        where, params = self._scope_clause(user_id)
         with self._lock:
             conn = self._get_conn()
             rows = conn.execute(
-                """SELECT id, ticker, side, entry_usd, exit_usd, pnl_usd, pnl_mult,
+                f"""SELECT id, ticker, side, entry_usd, exit_usd, pnl_usd, pnl_mult,
                           win, entry_min, exit_min, entry_ts, exit_ts, why, platform
                    FROM closed_trades
+                   {where}
                    ORDER BY id DESC
                    LIMIT ? OFFSET ?""",
-                (limit, offset),
+                (*params, limit, offset),
             ).fetchall()
         return [
             {
@@ -141,39 +222,80 @@ class TradeDB:
             for r in rows
         ]
 
-    def get_total_count(self) -> int:
+    def get_total_count(self, user_id: int | None = SYSTEM_UID) -> int:
+        where, params = self._scope_clause(user_id)
         with self._lock:
             conn = self._get_conn()
-            row = conn.execute("SELECT COUNT(*) FROM closed_trades").fetchone()
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM closed_trades {where}", params
+            ).fetchone()
             return row[0] if row else 0
 
-    def get_stats(self) -> dict:
+    def get_stats(self, user_id: int | None = SYSTEM_UID) -> dict:
+        """Aggregate performance metrics for one tenant (or all when None).
+
+        Everything is computed in a single aggregate pass; the consecutive
+        win/loss streaks reuse the same query with a bounded LIMIT so the cost
+        stays flat as history grows.
+        """
+        where, params = self._scope_clause(user_id)
         with self._lock:
             conn = self._get_conn()
-            row = conn.execute("""
-                SELECT
-                    COUNT(*) as total,
-                    SUM(CASE WHEN win=1 THEN 1 ELSE 0 END) as wins,
-                    SUM(CASE WHEN win=0 THEN 1 ELSE 0 END) as losses,
-                    SUM(pnl_usd) as total_pnl,
-                    AVG(pnl_usd) as avg_pnl
-                FROM closed_trades
-            """).fetchone()
-        total, wins, losses, total_pnl, avg_pnl = row
+            row = conn.execute(
+                f"""SELECT
+                        COUNT(*)                                        AS total,
+                        SUM(CASE WHEN win=1 THEN 1 ELSE 0 END)          AS wins,
+                        SUM(CASE WHEN win=0 THEN 1 ELSE 0 END)          AS losses,
+                        SUM(pnl_usd)                                    AS total_pnl,
+                        AVG(pnl_usd)                                    AS avg_pnl,
+                        SUM(CASE WHEN win=1 THEN pnl_usd ELSE 0 END)    AS gross_profit,
+                        SUM(CASE WHEN win=0 THEN pnl_usd ELSE 0 END)    AS gross_loss,
+                        AVG(CASE WHEN win=1 THEN pnl_usd END)           AS avg_win,
+                        AVG(CASE WHEN win=0 THEN pnl_usd END)           AS avg_loss
+                    FROM closed_trades {where}""",
+                params,
+            ).fetchone()
+            streak_rows = conn.execute(
+                f"SELECT win FROM closed_trades {where} ORDER BY id DESC LIMIT 500",
+                params,
+            ).fetchall()
+
+        total, wins, losses, total_pnl, avg_pnl, gross_profit, gross_loss, avg_win, avg_loss = row
+        max_cw = max_cl = cur_w = cur_l = 0
+        for (w,) in streak_rows:
+            if w:
+                cur_w += 1
+                cur_l = 0
+                max_cw = max(max_cw, cur_w)
+            else:
+                cur_l += 1
+                cur_w = 0
+                max_cl = max(max_cl, cur_l)
         return {
             "total": total or 0,
+            "total_trades": total or 0,
             "wins": wins or 0,
             "losses": losses or 0,
             "profit_rate": round((wins or 0) / (total or 1), 3),
+            "win_rate": round((wins or 0) / (total or 1), 3),
             "total_pnl": round(total_pnl or 0, 2),
             "avg_pnl": round(avg_pnl or 0, 2),
+            "avg_win": round(avg_win or 0, 2),
+            "avg_loss": round(avg_loss or 0, 2),
+            "gross_profit": round(gross_profit or 0, 2),
+            "gross_loss": round(gross_loss or 0, 2),
+            "max_consec_wins": max_cw,
+            "max_consec_losses": max_cl,
         }
 
-    def clear_all(self) -> int:
+    def clear_all(self, user_id: int | None = SYSTEM_UID) -> int:
+        where, params = self._scope_clause(user_id)
         with self._lock:
             conn = self._get_conn()
-            row = conn.execute("SELECT COUNT(*) FROM closed_trades").fetchone()
-            conn.execute("DELETE FROM closed_trades")
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM closed_trades {where}", params
+            ).fetchone()
+            conn.execute(f"DELETE FROM closed_trades {where}", params)
             conn.commit()
             return row[0] if row else 0
 
@@ -185,8 +307,9 @@ class TradeDB:
             now = time.time()
             cur = conn.execute(
                 """INSERT OR REPLACE INTO open_trades
-                   (ticker, side, entry_usd, entry_min, entry_ts, platform, order_id, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (ticker, side, entry_usd, entry_min, entry_ts, platform, order_id,
+                    user_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     trade.get("ticker", ""),
                     trade.get("side", "BUY"),
@@ -195,17 +318,21 @@ class TradeDB:
                     trade.get("entry_ts"),
                     trade.get("platform", "JUP"),
                     trade.get("order_id", ""),
+                    int(trade.get("user_id", SYSTEM_UID) or 0),
                     now,
                 ),
             )
             conn.commit()
             return cur.lastrowid
 
-    def get_open_trades(self) -> list[dict]:
+    def get_open_trades(self, user_id: int | None = SYSTEM_UID) -> list[dict]:
+        where, params = self._scope_clause(user_id)
         with self._lock:
             conn = self._get_conn()
             rows = conn.execute(
-                "SELECT ticker, side, entry_usd, entry_min, entry_ts, platform, order_id FROM open_trades"
+                f"""SELECT ticker, side, entry_usd, entry_min, entry_ts, platform, order_id
+                    FROM open_trades {where}""",
+                params,
             ).fetchall()
         return [
             {
@@ -220,12 +347,25 @@ class TradeDB:
             for r in rows
         ]
 
-    def remove_open_trade(self, ticker: str) -> bool:
+    def remove_open_trade(self, ticker: str, user_id: int | None = SYSTEM_UID) -> bool:
         with self._lock:
             conn = self._get_conn()
-            cur = conn.execute("DELETE FROM open_trades WHERE ticker=?", (ticker,))
+            if user_id is None:
+                cur = conn.execute("DELETE FROM open_trades WHERE ticker=?", (ticker,))
+            else:
+                cur = conn.execute(
+                    "DELETE FROM open_trades WHERE ticker=? AND user_id=?",
+                    (ticker, int(user_id)),
+                )
             conn.commit()
             return cur.rowcount > 0
+
+    @staticmethod
+    def _scope_clause(user_id: int | None) -> tuple[str, tuple]:
+        """Build the tenancy WHERE clause. ``None`` = all tenants."""
+        if user_id is None:
+            return "", ()
+        return "WHERE user_id=?", (int(user_id),)
 
     # ── settings (API keys, perp configs) ──────────────────────────────────
 
@@ -400,6 +540,8 @@ class TradeDB:
                 run_start_time  TEXT,
                 run_end_time    TEXT,
                 max_position_usd REAL DEFAULT 100,
+                min_trade_usd   REAL DEFAULT 10,
+                max_trade_usd   REAL DEFAULT 100,
                 allowed_tickers TEXT DEFAULT '',
                 take_profit_pct REAL DEFAULT 3.0,
                 stop_loss_pct   REAL DEFAULT 1.5,
@@ -407,8 +549,29 @@ class TradeDB:
                 FOREIGN KEY (user_id) REFERENCES members(id) ON DELETE CASCADE
             )
         """)
+        # Legacy DBs: add the per-trade amount band in place.
+        self._ensure_column(conn, "user_settings", "min_trade_usd", "REAL DEFAULT 10")
+        self._ensure_column(conn, "user_settings", "max_trade_usd", "REAL DEFAULT 100")
         conn.commit()
         self._ensure_admin()
+
+    #: Column list shared by the user_settings read/write paths.
+    USER_SETTINGS_COLUMNS = (
+        "api_key", "api_secret", "api_passphrase",
+        "risk_preference", "trade_mode", "run_start_time", "run_end_time",
+        "max_position_usd", "min_trade_usd", "max_trade_usd",
+        "allowed_tickers", "take_profit_pct", "stop_loss_pct",
+    )
+
+    #: Defaults applied when a member saves a partial payload.
+    USER_SETTINGS_DEFAULTS: dict[str, Any] = {
+        "api_key": "", "api_secret": "", "api_passphrase": "",
+        "risk_preference": "balanced", "trade_mode": "signal_only",
+        "run_start_time": "00:00", "run_end_time": "23:59",
+        "max_position_usd": 100, "min_trade_usd": 10, "max_trade_usd": 100,
+        "allowed_tickers": "", "take_profit_pct": 3.0, "stop_loss_pct": 1.5,
+    }
+
 
     def _ensure_admin(self) -> None:
         conn = self._get_conn()
@@ -436,19 +599,22 @@ class TradeDB:
             ).fetchone()
             if existing:
                 return {"ok": True, "created": False}
-            now = time.time()
-            conn.execute(
-                """INSERT INTO user_settings
-                   (user_id, api_key, api_secret, api_passphrase,
-                    risk_preference, trade_mode, run_start_time, run_end_time,
-                    max_position_usd, allowed_tickers, take_profit_pct, stop_loss_pct,
-                    updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (user_id, "", "", "", "balanced", "signal_only",
-                 "00:00", "23:59", 100, "", 3.0, 1.5, now),
-            )
+            self._insert_user_settings(conn, user_id, dict(self.USER_SETTINGS_DEFAULTS))
             conn.commit()
             return {"ok": True, "created": True}
+
+    def _insert_user_settings(self, conn: sqlite3.Connection, user_id: int,
+                              settings: dict) -> None:
+        """INSERT a fresh user_settings row. Caller must hold self._lock."""
+        cols = ", ".join(self.USER_SETTINGS_COLUMNS)
+        marks = ", ".join("?" for _ in self.USER_SETTINGS_COLUMNS)
+        vals = tuple(settings.get(c, self.USER_SETTINGS_DEFAULTS.get(c))
+                     for c in self.USER_SETTINGS_COLUMNS)
+        conn.execute(
+            f"INSERT INTO user_settings (user_id, {cols}, updated_at) "
+            f"VALUES (?, {marks}, ?)",
+            (user_id, *vals, time.time()),
+        )
 
     def register(self, username: str, password: str, email: str = "", role: str = "user") -> dict:
         with self._lock:
@@ -469,16 +635,7 @@ class TradeDB:
                 (uid, 0.0, 0, 0.0, now),
             )
             # Auto-create default user_settings for the new user
-            conn.execute(
-                """INSERT INTO user_settings
-                   (user_id, api_key, api_secret, api_passphrase,
-                    risk_preference, trade_mode, run_start_time, run_end_time,
-                    max_position_usd, allowed_tickers, take_profit_pct, stop_loss_pct,
-                    updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (uid, "", "", "", "balanced", "signal_only",
-                 "00:00", "23:59", 100, "", 3.0, 1.5, now),
-            )
+            self._insert_user_settings(conn, uid, dict(self.USER_SETTINGS_DEFAULTS))
             conn.commit()
             return {"ok": True, "user_id": uid, "username": username}
 
@@ -507,22 +664,46 @@ class TradeDB:
             return {"ok": True, "user_id": uid, "username": username, "token": token, "role": role, "tier": tier}
 
     def validate_session(self, token: str) -> dict | None:
+        """Resolve a session token to its member info.
+
+        Results are memoised for SESSION_CACHE_TTL seconds. The dashboard polls
+        at 1 Hz per connected client; without this cache every poll would hit
+        SQLite for an identical answer.
+        """
+        if not token:
+            return None
+        now = time.time()
+        cached = self._sess_cache.get(token)
+        if cached is not None and (now - cached[0]) < self.SESSION_CACHE_TTL:
+            return cached[1]
         with self._lock:
             conn = self._get_conn()
             row = conn.execute(
                 "SELECT s.user_id, m.username, m.role, m.tier FROM sessions s JOIN members m ON s.user_id=m.id WHERE s.token=? AND s.expires_at>? LIMIT 1",
-                (token, time.time()),
+                (token, now),
             ).fetchone()
-            if not row:
-                return None
-            return {"user_id": row[0], "username": row[1], "role": row[2], "tier": row[3]}
+            info = None if not row else {
+                "user_id": row[0], "username": row[1], "role": row[2], "tier": row[3],
+            }
+            self._sess_cache[token] = (now, info)
+            if len(self._sess_cache) > 512:
+                cutoff = now - self.SESSION_CACHE_TTL
+                self._sess_cache = {
+                    k: v for k, v in self._sess_cache.items() if v[0] >= cutoff
+                }
+        return info
+
+    def invalidate_session(self, token: str) -> None:
+        """Drop a memoised session (called on logout / member deletion)."""
+        self._sess_cache.pop(token, None)
 
     def logout(self, token: str) -> bool:
         with self._lock:
             conn = self._get_conn()
             cur = conn.execute("DELETE FROM sessions WHERE token=?", (token,))
             conn.commit()
-            return cur.rowcount > 0
+        self._sess_cache.pop(token, None)
+        return cur.rowcount > 0
 
     def update_leaderboard(self, user_id: int, pnl: float, trade_count: int, win_rate: float) -> None:
         with self._lock:
@@ -595,14 +776,27 @@ class TradeDB:
     def delete_member(self, target_id: int) -> dict:
         with self._lock:
             conn = self._get_conn()
-            admin = conn.execute("SELECT id FROM members WHERE role='admin'").fetchall()
-            if len(admin) <= 1:
-                return {"ok": False, "error": "must keep at least one admin"}
+            # Only refuse when the target IS an admin and would leave the site
+            # with no administrator at all.
+            target_role = conn.execute(
+                "SELECT role FROM members WHERE id=?", (target_id,)
+            ).fetchone()
+            if target_role and target_role[0] == "admin":
+                admins = conn.execute(
+                    "SELECT COUNT(*) FROM members WHERE role='admin'"
+                ).fetchone()[0]
+                if admins <= 1:
+                    return {"ok": False, "error": "must keep at least one admin"}
+            tokens = [r[0] for r in conn.execute(
+                "SELECT token FROM sessions WHERE user_id=?", (target_id,)
+            ).fetchall()]
             conn.execute("DELETE FROM sessions WHERE user_id=?", (target_id,))
             conn.execute("DELETE FROM user_settings WHERE user_id=?", (target_id,))
             conn.execute("DELETE FROM members WHERE id=?", (target_id,))
             conn.commit()
-            return {"ok": True}
+        for tk in tokens:
+            self._sess_cache.pop(tk, None)
+        return {"ok": True}
 
     # ── user_settings CRUD ──────────────────────────────────────────────────
 
@@ -612,7 +806,8 @@ class TradeDB:
             row = conn.execute(
                 "SELECT user_id, api_key, api_secret, api_passphrase,"
                 " risk_preference, trade_mode, run_start_time, run_end_time,"
-                " max_position_usd, allowed_tickers, take_profit_pct, stop_loss_pct,"
+                " max_position_usd, min_trade_usd, max_trade_usd,"
+                " allowed_tickers, take_profit_pct, stop_loss_pct,"
                 " updated_at FROM user_settings WHERE user_id=?",
                 (user_id,),
             ).fetchone()
@@ -623,9 +818,33 @@ class TradeDB:
             "api_passphrase": row[3], "risk_preference": row[4],
             "trade_mode": row[5], "run_start_time": row[6],
             "run_end_time": row[7], "max_position_usd": row[8],
-            "allowed_tickers": row[9], "take_profit_pct": row[10],
-            "stop_loss_pct": row[11], "updated_at": row[12],
+            "min_trade_usd": row[9], "max_trade_usd": row[10],
+            "allowed_tickers": row[11], "take_profit_pct": row[12],
+            "stop_loss_pct": row[13], "updated_at": row[14],
         }
+
+    def get_users_with_api_keys(self) -> list[dict]:
+        """Members that completed their OKX credential setup.
+
+        Used by the account refresher to decide whose account snapshot to keep
+        warm. Returns only the fields needed to build an executor.
+        """
+        with self._lock:
+            conn = self._get_conn()
+            rows = conn.execute(
+                """SELECT u.user_id, u.api_key, u.api_secret, u.api_passphrase,
+                          u.risk_preference, u.trade_mode,
+                          u.min_trade_usd, u.max_trade_usd, u.max_position_usd,
+                          u.take_profit_pct, u.stop_loss_pct
+                   FROM user_settings u JOIN members m ON u.user_id = m.id
+                   WHERE TRIM(COALESCE(u.api_key,'')) <> ''
+                     AND TRIM(COALESCE(u.api_secret,'')) <> ''
+                     AND TRIM(COALESCE(u.api_passphrase,'')) <> ''"""
+            ).fetchall()
+        keys = ("user_id", "api_key", "api_secret", "api_passphrase",
+                "risk_preference", "trade_mode", "min_trade_usd", "max_trade_usd",
+                "max_position_usd", "take_profit_pct", "stop_loss_pct")
+        return [dict(zip(keys, r)) for r in rows]
 
     def upsert_user_settings(self, user_id: int, settings: dict) -> dict:
         with self._lock:
@@ -635,54 +854,15 @@ class TradeDB:
             ).fetchone()
             now = time.time()
             if existing:
+                sets = ", ".join(f"{c}=?" for c in self.USER_SETTINGS_COLUMNS)
+                vals = tuple(settings.get(c, self.USER_SETTINGS_DEFAULTS.get(c))
+                             for c in self.USER_SETTINGS_COLUMNS)
                 conn.execute(
-                    """UPDATE user_settings SET
-                       api_key=?, api_secret=?, api_passphrase=?,
-                       risk_preference=?, trade_mode=?,
-                       run_start_time=?, run_end_time=?,
-                       max_position_usd=?, allowed_tickers=?,
-                       take_profit_pct=?, stop_loss_pct=?,
-                       updated_at=?
-                       WHERE user_id=?""",
-                    (
-                        settings.get("api_key", ""),
-                        settings.get("api_secret", ""),
-                        settings.get("api_passphrase", ""),
-                        settings.get("risk_preference", "balanced"),
-                        settings.get("trade_mode", "signal_only"),
-                        settings.get("run_start_time"),
-                        settings.get("run_end_time"),
-                        settings.get("max_position_usd", 100),
-                        settings.get("allowed_tickers", ""),
-                        settings.get("take_profit_pct", 3.0),
-                        settings.get("stop_loss_pct", 1.5),
-                        now, user_id,
-                    ),
+                    f"UPDATE user_settings SET {sets}, updated_at=? WHERE user_id=?",
+                    (*vals, now, user_id),
                 )
             else:
-                conn.execute(
-                    """INSERT INTO user_settings
-                       (user_id, api_key, api_secret, api_passphrase,
-                        risk_preference, trade_mode, run_start_time, run_end_time,
-                        max_position_usd, allowed_tickers, take_profit_pct, stop_loss_pct,
-                        updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        user_id,
-                        settings.get("api_key", ""),
-                        settings.get("api_secret", ""),
-                        settings.get("api_passphrase", ""),
-                        settings.get("risk_preference", "balanced"),
-                        settings.get("trade_mode", "signal_only"),
-                        settings.get("run_start_time"),
-                        settings.get("run_end_time"),
-                        settings.get("max_position_usd", 100),
-                        settings.get("allowed_tickers", ""),
-                        settings.get("take_profit_pct", 3.0),
-                        settings.get("stop_loss_pct", 1.5),
-                        now,
-                    ),
-                )
+                self._insert_user_settings(conn, user_id, settings)
             conn.commit()
             return {"ok": True}
 

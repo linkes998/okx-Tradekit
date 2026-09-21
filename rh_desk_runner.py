@@ -60,6 +60,10 @@ class DeskRunner:
         self._perp_close_log: list[dict] = []           # recent closes for UI display
         self._perp_allow_reopen: bool = True             # default: allow re-entry
         self._perp_max_position_usd: float = 1000.0      # default max position size
+        self._perp_min_trade_usd: float = 0.0            # default min position size
+        # Scatter projection memo: (token_list_ref, pts, centroid, tick_count)
+        self._scatter_cache: tuple | None = None
+        self._scatter_cache_refresh = 25                 # recompute every ~25 pushes
         self._trade_mode: str = "signal_only"            # "signal_only" or "auto"
         self._mode_changed: threading.Event = threading.Event()  # signalled when trade_mode is updated from UI
 
@@ -439,6 +443,7 @@ class DeskRunner:
                     if self._platform_tag == "OKX":
                         self._refresh_okx_account_cache(force=False)
                         self._check_and_close_perp_positions()
+                        self._housekeep_swaps()
                         self._auto_submit_pending_swaps()
                     self._push_current_state()
                     self._tick_count += 1
@@ -557,19 +562,35 @@ class DeskRunner:
             )
         self._track_trades()
 
-    def _auto_submit_pending_swaps(self) -> None:
-        """Auto-submit OKX pending swaps to avoid accumulation.
-
-        Submits pending swaps in batches, at most every 5 seconds,
-        to prevent flooding the OKX API while ensuring timely execution.
-        Also cleans up expired pending swaps.
-        """
+    def _housekeep_swaps(self) -> None:
+        """Drop expired pending swaps. Runs in every mode — only the
+        *submission* is gated on trade_mode, not the bookkeeping."""
         trader = self.server.trader
         if not trader:
             return
+        try:
+            trader._cleanup_expired_swaps()
+        except Exception as e:
+            print(f"[DeskRunner] swap cleanup failed: {e}")
 
-        # Clean up expired pending swaps first
-        trader._cleanup_expired_swaps()
+    def _auto_submit_pending_swaps(self) -> None:
+        """Auto-submit OKX pending swaps — "auto" trade mode only.
+
+        Submits pending swaps in batches, at most every 5 seconds,
+        to prevent flooding the OKX API while ensuring timely execution.
+
+        Gated on trade_mode == "auto": "Signal Only" is the documented
+        default where the AI merely proposes and the member confirms in the
+        UI, so the desk must NOT push those orders to the exchange on its
+        own. In signal_only the swaps simply stay pending until the member
+        submits them.
+        """
+        if self._trade_mode != "auto":
+            return
+
+        trader = self.server.trader
+        if not trader:
+            return
 
         if len(trader.pending_swaps) == 0:
             return
@@ -608,9 +629,11 @@ class DeskRunner:
             if "max_hold_sec" in s: self._perp_max_hold_sec = int(s["max_hold_sec"])
             self._perp_allow_reopen = s.get("allow_reopen", "true") == "true"
             self._perp_max_position_usd = float(s.get("max_position_usd", "1000"))
+            # Minimum notional for a single entry (0 = no floor beyond OKX's)
+            self._perp_min_trade_usd = float(s.get("min_trade_usd", "0") or 0)
             # Auto-trade mode from DB (default: signal_only)
             self._trade_mode = s.get("trade_mode", "signal_only")
-            print(f"[DeskRunner] Perp settings reloaded: TP={self._perp_tp_pct}% SL={self._perp_sl_pct}% hold={self._perp_max_hold_sec}s reopen={self._perp_allow_reopen} max_usd={self._perp_max_position_usd} mode={self._trade_mode}")
+            print(f"[DeskRunner] Perp settings reloaded: TP={self._perp_tp_pct}% SL={self._perp_sl_pct}% hold={self._perp_max_hold_sec}s reopen={self._perp_allow_reopen} size_band=${self._perp_min_trade_usd:.0f}-${self._perp_max_position_usd:.0f} mode={self._trade_mode}")
         except Exception as e:
             print(f"[DeskRunner] WARNING — perp settings reload failed: {e}")
 
@@ -658,15 +681,19 @@ class DeskRunner:
             # Build OKX instrument ID for SWAP
             inst_id = f"{tok.ticker}-USDT-SWAP"
 
-            # Determine position size from desk position
+            # Determine position size from desk position, then clamp it into
+            # the configured per-trade band (min_trade_usd … max_position_usd).
             stake_usd = new_pos.entry_usd
+            band_lo = max(self._perp_min_trade_usd, OKX_MIN_ORDER_USD)
+            band_hi = self._perp_max_position_usd
+            if band_hi > 0 and stake_usd > band_hi:
+                print(f"[DeskRunner] AUTO-EXEC SIZE {tok.ticker}: ${stake_usd:.2f} capped to max ${band_hi:.2f}")
+                stake_usd = band_hi
+            if stake_usd < band_lo:
+                print(f"[DeskRunner] AUTO-EXEC SIZE {tok.ticker}: ${stake_usd:.2f} raised to min ${band_lo:.2f}")
+                stake_usd = band_lo
             if stake_usd < OKX_MIN_ORDER_USD:
                 print(f"[DeskRunner] AUTO-EXEC SKIP {tok.ticker}: stake ${stake_usd:.2f} below min ${OKX_MIN_ORDER_USD}")
-                return
-
-            # Check max position size
-            if stake_usd > self._perp_max_position_usd:
-                print(f"[DeskRunner] AUTO-EXEC SKIP {tok.ticker}: stake ${stake_usd:.2f} exceeds max ${self._perp_max_position_usd}")
                 return
 
             # Check cooldown (30s)
@@ -721,13 +748,15 @@ class DeskRunner:
             # Skip if below OKX minimum order size
             if size_usd < OKX_MIN_ORDER_USD:
                 continue
-            # Skip if exceeds max position size
-            if size_usd > self._perp_max_position_usd:
-                continue
-            # Skip if recently closed (cooldown) — only if reopen not allowed
+            # NOTE: an oversized position must still be closable — the per-trade
+            # upper band is an ENTRY limit, never an exit blocker.
+            # A position may only be closed once per cooldown window. The
+            # allow_reopen flag governs whether the coin can be RE-ENTERED
+            # afterwards — it must not disable the close cooldown, otherwise
+            # the cached snapshot (up to 30s stale) would trigger the same
+            # close order on every 400ms tick.
             if ticker in self._perp_last_exit and now - self._perp_last_exit[ticker] < 30:
-                if not self._perp_allow_reopen:
-                    continue
+                continue
             # Compute entry vs current price percentage change
             if side == "LONG":
                 pct_change = (last_px - avg_px) / avg_px * 100
@@ -765,6 +794,39 @@ class DeskRunner:
             except Exception as e:
                 print(f"[DeskRunner] AUTO-CLOSE ERROR {ticker}: {e}")
                 import traceback; traceback.print_exc()
+
+    def _scatter_projection(self):
+        """2-D projection of the token scatter, memoised between ticks.
+
+        Building the embedding matrix and running the SVD was the single most
+        expensive step in the push loop, yet the token set only changes on the
+        refresh interval (minutes) while pushes happen every few hundred ms.
+        Recomputing at most every ``_scatter_cache_refresh`` pushes removes that
+        cost from the hot path. The cache key includes the token list identity,
+        which changes whenever the token list is rebuilt.
+        """
+        cached = self._scatter_cache
+        if (cached is not None
+                and cached[0] is self.scatter_tokens
+                and (self._tick_count - cached[3]) < self._scatter_cache_refresh):
+            return cached[1], cached[2]
+
+        pts, centroid_xy = [], None
+        try:
+            df = self.desk.narrative.project_2d(self.scatter_tokens)
+            pts = df[["x", "y"]].values.tolist() if hasattr(df, "values") else []
+            c = self.desk.narrative.cluster_centroid
+            if c is not None and self.scatter_tokens:
+                X = np.vstack([self.desk.narrative.embed_token(t) for t in self.scatter_tokens] + [c])
+                X = X - X.mean(axis=0)
+                U, S, _ = np.linalg.svd(X, full_matrices=False)
+                xy_all = (U[:, :2] * S[:2]).tolist()
+                pts = xy_all[:-1]
+                centroid_xy = xy_all[-1]
+        except Exception:
+            pass
+        self._scatter_cache = (self.scatter_tokens, pts, centroid_xy, self._tick_count)
+        return pts, centroid_xy
 
     def _push_current_state(self) -> None:
         """Build full state dict (desk + swaps) and push to SSE queue."""
@@ -888,20 +950,7 @@ class DeskRunner:
             "sim_open_count": len(self.desk.positions),
         }
 
-        pts, centroid_xy = [], None
-        try:
-            df = self.desk.narrative.project_2d(self.scatter_tokens)
-            pts = df[["x", "y"]].values.tolist() if hasattr(df, "values") else []
-            c = self.desk.narrative.cluster_centroid
-            if c is not None and self.scatter_tokens:
-                X = np.vstack([self.desk.narrative.embed_token(t) for t in self.scatter_tokens] + [c])
-                X = X - X.mean(axis=0)
-                U, S, _ = np.linalg.svd(X, full_matrices=False)
-                xy_all = (U[:, :2] * S[:2]).tolist()
-                pts = xy_all[:-1]
-                centroid_xy = xy_all[-1]
-        except Exception:
-            pass
+        pts, centroid_xy = self._scatter_projection()
 
         scatter_meta = [{"ticker": t.ticker, "theme": t.theme_hint,
                          "desc": (t.description or "")[:40]} for t in self.scatter_tokens]

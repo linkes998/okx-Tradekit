@@ -14,9 +14,11 @@ Architecture:
 """
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import queue
+import socket
 import threading
 import time
 import urllib.request
@@ -28,11 +30,13 @@ from typing import Any
 from rh_trencher import Desk, TokenLaunch, scenario
 from rh_live_trader import LiveTrader, PendingSwap
 from rh_jupiter_executor import JupiterExecutor
-from db_trades import TradeDB
+from db_trades import TradeDB, SYSTEM_UID
+from user_account import UserAccountManager
 try:
-    from rh_okx_executor import OKXExecutor
+    from rh_okx_executor import OKXExecutor, OKX_MIN_ORDER_USD
 except ImportError:
     OKXExecutor = None
+    OKX_MIN_ORDER_USD = 10.0
 
 # ── Globals ──────────────────────────────────────────────────────
 _server: "ServerState | None" = None
@@ -40,6 +44,17 @@ _server: "ServerState | None" = None
 # ── Live-mode push pipeline ──────────────────────────────────────
 _live_queue: queue.Queue[dict] | None = None
 _runner: "DeskRunner | None" = None
+
+# ── Per-member OKX account contexts (own API key → own dashboard data) ──
+_account_mgr: UserAccountManager | None = None
+
+# ── Serialised /api/desk-state payload memo ───────────────────────
+# The desk state is rebuilt by the runner every tick but polled by every
+# connected client at 1 Hz. Serialising (and gzipping) once per
+# (state generation, tenant) turns N clients × 1 Hz into 1 encode per tick.
+_desk_payload_cache: dict[tuple[int, int], tuple[Any, bytes, int]] = {}
+_desk_cache_lock = threading.Lock()
+_DESK_CACHE_MAX = 16
 
 
 def push_state(state: dict) -> None:
@@ -623,6 +638,15 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
 .page-btn:hover{border-color:var(--cyan);color:var(--cyan)}
 .page-btn.active{background:rgba(6,182,212,0.15);border-color:var(--cyan);color:var(--cyan)}
 .page-info{font-size:10px;color:var(--text-dim);font-family:var(--mono);margin-right:8px}
+/* One-click close-position button */
+.btn-close-pos{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.45);color:var(--red);padding:2px 9px;border-radius:3px;font-family:var(--mono);font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;cursor:pointer;white-space:nowrap;transition:all .12s}
+.btn-close-pos:hover{background:var(--red);border-color:var(--red);color:#fff;box-shadow:0 0 8px rgba(239,68,68,.45)}
+.btn-close-pos:disabled,.btn-close-pos.busy{opacity:.45;cursor:wait;background:transparent;border-color:var(--border);color:var(--text-dim)}
+/* Per-member data banner */
+.acct-banner{display:flex;align-items:center;gap:8px;padding:7px 14px;margin:0 0 12px;border-radius:3px;font-family:var(--mono);font-size:10px;letter-spacing:.03em;background:var(--green-glow);border:1px solid rgba(34,197,94,.35);color:var(--green)}
+.acct-banner.warn{background:rgba(245,158,11,.1);border-color:rgba(245,158,11,.4);color:var(--amber)}
+.acct-banner.err{background:rgba(239,68,68,.1);border-color:rgba(239,68,68,.4);color:var(--red)}
+.acct-banner.muted{background:var(--surface);border-color:var(--border);color:var(--text-dim)}
 </style>
 </head>
 <body>
@@ -675,11 +699,16 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
 
     <!-- ═══ DASHBOARD PAGE ═══ -->
     <div class="page-section active" id="page-dashboard">
+    <div id="acct-banner" class="acct-banner muted" style="display:none">
+      <span class="badge-dot" style="background:currentColor;box-shadow:none"></span>
+      <span id="acct-banner-text"></span>
+      <span id="acct-banner-band" style="margin-left:auto;opacity:.85"></span>
+    </div>
     <div class="sig-row" id="manualRow" style="display:none">
-      <label>Ticker:</label><input id="manualTicker" type="text" value="BONK" style="width:90px">
-      <label>Side:</label><select id="manualSide"><option value="ENTRY">ENTRY (BUY)</option><option value="EXIT">EXIT (SELL)</option></select>
-      <label>USD:</label><input id="manualUsd" type="number" value="50" min="1" step="1" style="width:72px">
-      <button onclick="sendManualSignal()">SEND</button>
+      <label data-i18n="mr_ticker">Ticker:</label><input id="manualTicker" type="text" value="BONK" style="width:90px">
+      <label data-i18n="mr_side">Side:</label><select id="manualSide"><option value="ENTRY" data-i18n="mr_entry">ENTRY (BUY)</option><option value="EXIT" data-i18n="mr_exit">EXIT (SELL)</option></select>
+      <label data-i18n="mr_usd">USD:</label><input id="manualUsd" type="number" value="50" min="1" step="1" style="width:72px">
+      <button onclick="sendManualSignal()" data-i18n="btn_send">SEND</button>
     </div>
 
     <div class="landing-wrap" id="landing-card" style="display:none">
@@ -715,19 +744,19 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
         <div class="metric-sub" id="mon-pnl-sub">0.00%</div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">Open Positions</div>
+        <div class="metric-label" data-i18n="ml_open_positions">Open Positions</div>
         <div class="metric-value" id="mon-entry">—</div>
         <div class="metric-sub"><span id="mon-pos-sub">0 spot</span></div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">Kelly Fraction</div>
+        <div class="metric-label" data-i18n="ml_kelly_fraction">Kelly Fraction</div>
         <div class="metric-value" id="mon-kelly-panel">—</div>
         <div class="metric-sub" id="mon-kelly-sub">ATR: —</div>
       </div>
       <div class="metric-card">
-        <div class="metric-label">Builder Code</div>
+        <div class="metric-label" data-i18n="ml_builder_code">Builder Code</div>
         <div class="metric-value" style="font-size:14px">RB2-OKX</div>
-        <div class="metric-sub">Comm returned: $—</div>
+        <div class="metric-sub"><span data-i18n="comm_returned">Comm returned:</span> $—</div>
       </div>
     </div>
 
@@ -735,7 +764,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
     <div class="grid-main-side">
       <div class="panel with-pad" id="equity-card" style="padding:0">
         <div class="panel-header">
-          <div class="panel-title"><span class="dot"></span> Equity Curve</div>
+          <div class="panel-title" data-i18n="equityCurve"><span class="dot"></span> Equity Curve</div>
           <div style="display:flex;gap:12px">
             <span class="panel-action" style="color:var(--cyan)">3H</span><span class="panel-action">4H</span>
             <span class="panel-action">1D</span><span class="panel-action">ALL</span>
@@ -746,14 +775,14 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
 
       <div class="panel with-pad" id="feed-card" style="padding:0">
         <div class="panel-header" style="padding:14px 16px 8px;margin-bottom:0">
-          <div class="panel-title"><span class="dot amber"></span> Strategy Signals</div>
+          <div class="panel-title" data-i18n="strategySignals"><span class="dot amber"></span> Strategy Signals</div>
         </div>
         <div class="filter-bar">
           <div style="flex:1"></div>
-          <input class="filter-search" type="text" placeholder="Search ticker..." id="feed-search">
+          <input class="filter-search" type="text" placeholder="Search ticker..." data-i18n-ph="search_ticker" id="feed-search">
         </div>
         <div id="feed-list" class="feed-list" style="min-height:280px;max-height:320px;overflow-y:auto">
-          <div class="empty-row">— waiting for signals —</div>
+          <div class="empty-row" data-i18n="waiting_signals">— waiting for signals —</div>
         </div>
         <pre id="feed-log" style="display:none"></pre>
       </div>
@@ -762,44 +791,44 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
     <!-- Positions + Decisions -->
     <div class="grid-2">
       <div class="panel with-pad" id="positions-card" style="padding:0">
-        <div class="panel-header"><div class="panel-title"><span class="dot blue"></span> Open Positions</div><span class="panel-action">View All →</span></div>
+        <div class="panel-header"><div class="panel-title"><span class="dot blue"></span> <span data-i18n="positionsTitle">Open Positions</span> <span id="pos-owner-badge" class="badge" style="display:none;background:var(--green-dim);color:var(--green);padding:1px 5px;border-radius:2px;font-size:9px"></span></div><span class="panel-action" data-i18n="btn_view_all">View All →</span></div>
         <table class="data-table">
-          <thead><tr><th>Ticker</th><th>Side</th><th>Entry</th><th>Buy $</th><th>Peak</th><th>Current</th><th>Size%</th></tr></thead>
-          <tbody id="pos-body"><tr><td colspan="7" class="empty-row">— no open positions —</td></tr></tbody>
+          <thead><tr id="pos-thead"><th data-i18n="th_ticker">Ticker</th><th data-i18n="th_side">Side</th><th data-i18n="th_entry">Entry</th><th data-i18n="th_buy_usd">Buy $</th><th data-i18n="th_peak">Peak</th><th data-i18n="th_current">Current</th><th data-i18n="th_size_pct">Size%</th></tr></thead>
+          <tbody id="pos-body"><tr><td colspan="7" class="empty-row" data-i18n="no_open_positions">— no open positions —</td></tr></tbody>
         </table>
-        <div style="border-top:1px solid var(--border)">
-          <div class="panel-header" style="padding:10px 16px 6px"><div class="panel-title"><span class="dot"></span> History Trades</div></div>
+        <div id="pos-history-panel" style="border-top:1px solid var(--border)">
+          <div class="panel-header" style="padding:10px 16px 6px"><div class="panel-title"><span class="dot"></span> <span data-i18n="historyTitle">History Trades</span></div></div>
           <table class="data-table">
-            <thead><tr><th>Ticker</th><th>Side</th><th>Buy</th><th>Sell</th><th>P/L</th><th>Realized</th></tr></thead>
-            <tbody id="hist-body"><tr><td colspan="6" class="empty-row">— no history yet —</td></tr></tbody>
+            <thead><tr><th data-i18n="th_ticker">Ticker</th><th data-i18n="th_side">Side</th><th data-i18n="th_buy">Buy</th><th data-i18n="th_sell">Sell</th><th data-i18n="th_pl">P/L</th><th data-i18n="th_realized">Realized</th></tr></thead>
+            <tbody id="hist-body"><tr><td colspan="6" class="empty-row" data-i18n="no_history_yet">— no history yet —</td></tr></tbody>
           </table>
         </div>
       </div>
 
       <div class="panel with-pad" id="decision-log-card" style="padding:0">
-        <div class="panel-header"><div class="panel-title"><span class="dot amber"></span> AI Decisions <span id="decision-badge" class="badge" style="background:var(--amber-dim);color:var(--amber);padding:1px 5px;border-radius:2px;font-size:9px">(0)</span></div></div>
+        <div class="panel-header"><div class="panel-title"><span class="dot amber"></span> <span data-i18n="aiDecisions">AI Decisions</span> <span id="decision-badge" class="badge" style="background:var(--amber-dim);color:var(--amber);padding:1px 5px;border-radius:2px;font-size:9px">(0)</span></div></div>
         <div id="decision-list" style="max-height:460px;overflow-y:auto">
-          <div class="empty-row">— no AI decisions yet —</div>
+          <div class="empty-row" data-i18n="no_ai_decisions">— no AI decisions yet —</div>
         </div>
       </div>
     </div>
 
     <!-- Swaps -->
     <div class="grid-full" id="swaps-card">
-      <div class="panel-header"><div class="panel-title"><span class="dot"></span> Swap Bundles <span id="swap-badge" class="badge" style="background:var(--blue-dim);color:var(--blue);padding:1px 5px;border-radius:2px;font-size:9px">(0)</span></div></div>
+      <div class="panel-header"><div class="panel-title"><span class="dot"></span> <span data-i18n="swapsTitle">Swap Bundles</span> <span id="swap-badge" class="badge" style="background:var(--blue-dim);color:var(--blue);padding:1px 5px;border-radius:2px;font-size:9px">(0)</span></div></div>
       <table class="data-table">
-        <thead><tr><th>Side</th><th>Ticker</th><th>Amount $</th><th>Fee $</th><th>Impact</th><th>Out (est)</th><th>Action</th></tr></thead>
-        <tbody id="swap-body"><tr><td colspan="7" class="empty-row">— no pending swaps —</td></tr></tbody>
+        <thead><tr><th data-i18n="th_side">Side</th><th data-i18n="th_ticker">Ticker</th><th data-i18n="th_amount_usd">Amount $</th><th data-i18n="th_fee_usd">Fee $</th><th data-i18n="th_impact">Impact</th><th data-i18n="th_out_est">Out (est)</th><th data-i18n="th_action">Action</th></tr></thead>
+        <tbody id="swap-body"><tr><td colspan="7" class="empty-row" data-i18n="no_pending_swaps">— no pending swaps —</td></tr></tbody>
       </table>
       <div id="swap-pager" class="pager-bar" style="display:none"></div>
     </div>
 
     <!-- Perp -->
     <div class="grid-full" id="perp-positions-card" style="display:none">
-      <div class="panel-header"><div class="panel-title"><span class="dot"></span> Perpetual Positions <span id="perp-pos-badge" class="badge" style="background:var(--purple);color:#fff;padding:1px 5px;border-radius:2px;font-size:9px">(0)</span></div></div>
+      <div class="panel-header"><div class="panel-title"><span class="dot"></span> <span data-i18n="perpPositionsTitle">Perpetual Positions</span> <span id="perp-pos-badge" class="badge" style="background:var(--purple);color:#fff;padding:1px 5px;border-radius:2px;font-size:9px">(0)</span></div></div>
       <table class="data-table">
-        <thead><tr><th>Ticker</th><th>Side</th><th>Entry $</th><th>Current $</th><th>Notional</th><th>Leverage</th><th>PnL $</th><th>PnL %</th><th>Elapsed</th></tr></thead>
-        <tbody id="perp-pos-body"><tr><td colspan="9" class="empty-row">— no perpetual positions —</td></tr></tbody>
+        <thead><tr><th data-i18n="th_ticker">Ticker</th><th data-i18n="th_side">Side</th><th data-i18n="th_entry_usd">Entry $</th><th data-i18n="th_current_usd">Current $</th><th data-i18n="th_notional">Notional</th><th data-i18n="th_leverage">Leverage</th><th data-i18n="th_pnl_usd">PnL $</th><th data-i18n="th_pnl_pct">PnL %</th><th data-i18n="th_elapsed">Elapsed</th><th data-i18n="th_action">Action</th></tr></thead>
+        <tbody id="perp-pos-body"><tr><td colspan="10" class="empty-row" data-i18n="no_perp_positions">— no perpetual positions —</td></tr></tbody>
       </table>
       <div id="perp-pager" class="pager-bar" style="display:none"></div>
     </div>
@@ -808,24 +837,24 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
     <!-- ═══ POSITIONS PAGE ═══ -->
     <div class="page-section" id="page-positions">
       <div class="page-header">
-        <div><div class="page-title-main">Positions</div><div class="page-subtitle">Live spot &amp; perpetual positions across all platforms</div></div>
+        <div><div class="page-title-main" data-i18n="pg_positions">Positions</div><div class="page-subtitle" data-i18n="pg_positions_sub">Live spot &amp; perpetual positions across all platforms</div></div>
         <div style="display:flex;gap:8px">
-          <button class="topbar-btn" onclick="refreshPositionsPage()">Refresh</button>
+          <button class="topbar-btn" onclick="refreshPositionsPage()" data-i18n="btn_refresh">Refresh</button>
         </div>
       </div>
       <div class="grid-2">
         <div class="panel with-pad">
-          <div class="panel-header"><div class="panel-title"><span class="dot blue"></span> OKX Spot Positions</div><span class="panel-action" id="spot-pos-badge" style="color:var(--blue)">0</span></div>
+          <div class="panel-header"><div class="panel-title"><span class="dot blue"></span> <span data-i18n="pt_spot_positions">OKX Spot Positions</span></div><span class="panel-action" id="spot-pos-badge" style="color:var(--blue)">0</span></div>
           <table class="data-table">
-            <thead><tr><th>Ticker</th><th>Qty</th><th>Avg $</th><th>Current $</th><th>PnL $</th><th>PnL %</th></tr></thead>
-            <tbody id="spot-pos-body"><tr><td colspan="6" class="empty-row">— no spot positions —</td></tbody>
+            <thead><tr><th data-i18n="th_ticker">Ticker</th><th data-i18n="th_qty">Qty</th><th data-i18n="th_avg_usd">Avg $</th><th data-i18n="th_current_usd">Current $</th><th data-i18n="th_pnl_usd">PnL $</th><th data-i18n="th_pnl_pct">PnL %</th><th data-i18n="th_action">Action</th></tr></thead>
+            <tbody id="spot-pos-body"><tr><td colspan="7" class="empty-row" data-i18n="no_spot_positions">— no spot positions —</td></tbody>
           </table>
         </div>
         <div class="panel with-pad">
-          <div class="panel-header"><div class="panel-title"><span class="dot" style="background:var(--purple);box-shadow:0 0 6px var(--purple)"></span> OKX Perp Positions</div><span class="panel-action" id="perp-pos-badge-page" style="color:var(--purple)">0</span></div>
+          <div class="panel-header"><div class="panel-title"><span class="dot" style="background:var(--purple);box-shadow:0 0 6px var(--purple)"></span> <span data-i18n="pt_perp_positions">OKX Perp Positions</span></div><span class="panel-action" id="perp-pos-badge-page" style="color:var(--purple)">0</span></div>
           <table class="data-table">
-            <thead><tr><th>Ticker</th><th>Side</th><th>Entry $</th><th>Notional</th><th>Leverage</th><th>PnL $</th><th>PnL %</th></tr></thead>
-            <tbody id="perp-pos-body-page"><tr><td colspan="7" class="empty-row">— no perp positions —</td></tbody>
+            <thead><tr><th data-i18n="th_ticker">Ticker</th><th data-i18n="th_side">Side</th><th data-i18n="th_entry_usd">Entry $</th><th data-i18n="th_notional">Notional</th><th data-i18n="th_leverage">Leverage</th><th data-i18n="th_pnl_usd">PnL $</th><th data-i18n="th_pnl_pct">PnL %</th><th data-i18n="th_action">Action</th></tr></thead>
+            <tbody id="perp-pos-body-page"><tr><td colspan="8" class="empty-row" data-i18n="no_perp_positions_short">— no perp positions —</td></tbody>
           </table>
         </div>
       </div>
@@ -834,23 +863,23 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
     <!-- ═══ TRADES PAGE ═══ -->
     <div class="page-section" id="page-trades">
       <div class="page-header">
-        <div><div class="page-title-main">Trade History</div><div class="page-subtitle">Persistent trade records from database</div></div>
+        <div><div class="page-title-main" data-i18n="pg_trades">Trade History</div><div class="page-subtitle" data-i18n="pg_trades_sub">Persistent trade records from database</div></div>
         <div style="display:flex;gap:8px;align-items:center">
           <span id="trades-stat" class="page-subtitle" style="margin-right:8px">0 trades</span>
-          <button class="topbar-btn" onclick="loadTradesPage()">Refresh</button>
-          <button class="topbar-btn" style="color:var(--red);border-color:var(--red)" onclick="confirmClearTrades()">Clear</button>
+          <button class="topbar-btn" onclick="loadTradesPage()" data-i18n="btn_refresh">Refresh</button>
+          <button class="topbar-btn" style="color:var(--red);border-color:var(--red)" onclick="confirmClearTrades()" data-i18n="btn_clear">Clear</button>
         </div>
       </div>
       <div class="metrics-row" style="grid-template-columns:repeat(4,1fr);margin-bottom:12px">
-        <div class="metric-card"><div class="metric-label">Total Trades</div><div class="metric-value" id="tr-stat-total">—</div></div>
-        <div class="metric-card"><div class="metric-label">Win Rate</div><div class="metric-value" id="tr-stat-winrate">—</div></div>
-        <div class="metric-card"><div class="metric-label">Total PnL</div><div class="metric-value" id="tr-stat-pnl">—</div></div>
-        <div class="metric-card"><div class="metric-label">Avg PnL/Trade</div><div class="metric-value" id="tr-stat-avg">—</div></div>
+        <div class="metric-card"><div class="metric-label" data-i18n="ml_total_trades">Total Trades</div><div class="metric-value" id="tr-stat-total">—</div></div>
+        <div class="metric-card"><div class="metric-label" data-i18n="ml_win_rate">Win Rate</div><div class="metric-value" id="tr-stat-winrate">—</div></div>
+        <div class="metric-card"><div class="metric-label" data-i18n="ml_total_pnl">Total PnL</div><div class="metric-value" id="tr-stat-pnl">—</div></div>
+        <div class="metric-card"><div class="metric-label" data-i18n="ml_avg_pnl">Avg PnL/Trade</div><div class="metric-value" id="tr-stat-avg">—</div></div>
       </div>
       <div class="panel with-pad" style="padding:0">
         <table class="data-table">
-          <thead><tr><th>ID</th><th>Ticker</th><th>Side</th><th>Entry $</th><th>Exit $</th><th>PnL $</th><th>Mult</th><th>Win</th><th>Platform</th><th>Why</th><th>Time</th></tr></thead>
-          <tbody id="trades-body"><tr><td colspan="11" class="empty-row">Loading...</td></tr></tbody>
+          <thead><tr><th data-i18n="th_id">ID</th><th data-i18n="th_ticker">Ticker</th><th data-i18n="th_side">Side</th><th data-i18n="th_entry_usd">Entry $</th><th data-i18n="th_exit_usd">Exit $</th><th data-i18n="th_pnl_usd">PnL $</th><th data-i18n="th_mult">Mult</th><th data-i18n="th_win">Win</th><th data-i18n="th_platform">Platform</th><th data-i18n="th_why">Why</th><th data-i18n="th_time">Time</th></tr></thead>
+          <tbody id="trades-body"><tr><td colspan="11" class="empty-row" data-i18n="loading">Loading...</td></tr></tbody>
         </table>
         <div id="trades-pager" class="pager-bar"></div>
       </div>
@@ -859,25 +888,25 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
     <!-- ═══ OKX SPOT PAGE ═══ -->
     <div class="page-section" id="page-spot">
       <div class="page-header">
-        <div><div class="page-title-main">OKX Spot</div><div class="page-subtitle">Spot trading &amp; balance management</div></div>
+        <div><div class="page-title-main" data-i18n="pg_spot">OKX Spot</div><div class="page-subtitle" data-i18n="pg_spot_sub">Spot trading &amp; balance management</div></div>
       </div>
       <div class="metrics-row" style="grid-template-columns:repeat(3,1fr)">
-        <div class="metric-card"><div class="metric-label">Total Equity (USD)</div><div class="metric-value" id="okx-spot-equity">—</div></div>
-        <div class="metric-card"><div class="metric-label">Available USDT</div><div class="metric-value" id="okx-spot-avail">—</div></div>
-        <div class="metric-card"><div class="metric-label">Holdings Value</div><div class="metric-value" id="okx-spot-holdings">—</div></div>
+        <div class="metric-card"><div class="metric-label" data-i18n="ml_spot_equity">Total Equity (USD)</div><div class="metric-value" id="okx-spot-equity">—</div></div>
+        <div class="metric-card"><div class="metric-label" data-i18n="ml_spot_avail">Available USDT</div><div class="metric-value" id="okx-spot-avail">—</div></div>
+        <div class="metric-card"><div class="metric-label" data-i18n="ml_spot_holdings">Holdings Value</div><div class="metric-value" id="okx-spot-holdings">—</div></div>
       </div>
       <div class="panel with-pad">
-        <div class="panel-header"><div class="panel-title"><span class="dot blue"></span> Spot Holdings</div></div>
+        <div class="panel-header"><div class="panel-title"><span class="dot blue"></span> <span data-i18n="pt_spot_holdings">Spot Holdings</span></div></div>
         <table class="data-table">
-          <thead><tr><th>Asset</th><th>Total</th><th>Available</th><th>Locked</th><th>USDT Value</th></tr></thead>
-          <tbody id="okx-spot-holdings-body"><tr><td colspan="5" class="empty-row">Loading...</td></tbody>
+          <thead><tr><th data-i18n="th_asset">Asset</th><th data-i18n="th_total">Total</th><th data-i18n="th_available">Available</th><th data-i18n="th_locked">Locked</th><th data-i18n="th_usdt_value">USDT Value</th></tr></thead>
+          <tbody id="okx-spot-holdings-body"><tr><td colspan="5" class="empty-row" data-i18n="loading">Loading...</td></tbody>
         </table>
       </div>
       <div class="panel with-pad">
-        <div class="panel-header"><div class="panel-title"><span class="dot"></span> Recent Spot Trades</div></div>
+        <div class="panel-header"><div class="panel-title"><span class="dot"></span> <span data-i18n="pt_spot_trades">Recent Spot Trades</span></div></div>
         <table class="data-table">
-          <thead><tr><th>Time</th><th>Pair</th><th>Side</th><th>Exec Price</th><th>Amount</th><th>Filled</th><th>Fee</th></tr></thead>
-          <tbody id="okx-spot-trades-body"><tr><td colspan="7" class="empty-row">No recent trades</td></tbody>
+          <thead><tr><th data-i18n="th_time">Time</th><th data-i18n="th_pair">Pair</th><th data-i18n="th_side">Side</th><th data-i18n="th_exec_price">Exec Price</th><th data-i18n="th_amount">Amount</th><th data-i18n="th_filled">Filled</th><th data-i18n="th_fee">Fee</th></tr></thead>
+          <tbody id="okx-spot-trades-body"><tr><td colspan="7" class="empty-row" data-i18n="no_recent_trades">No recent trades</td></tbody>
         </table>
       </div>
     </div><!-- /page-spot -->
@@ -885,28 +914,28 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
     <!-- ═══ PERP ENGINE PAGE ═══ -->
     <div class="page-section" id="page-perp">
       <div class="page-header">
-        <div><div class="page-title-main">Perp Engine</div><div class="page-subtitle">Perpetual futures trading with auto risk controls</div></div>
+        <div><div class="page-title-main" data-i18n="pg_perp">Perp Engine</div><div class="page-subtitle" data-i18n="pg_perp_sub">Perpetual futures trading with auto risk controls</div></div>
       </div>
       <div class="metrics-row" style="grid-template-columns:repeat(4,1fr)">
-        <div class="metric-card"><div class="metric-label">Perp Equity</div><div class="metric-value" id="okx-perp-equity">—</div></div>
-        <div class="metric-card"><div class="metric-label">Open UPL</div><div class="metric-value" id="okx-perp-upl">—</div></div>
-        <div class="metric-card"><div class="metric-label">Open Positions</div><div class="metric-value" id="okx-perp-positions-count">—</div></div>
-        <div class="metric-card"><div class="metric-label">Auto-Close Rules</div><div class="metric-value" style="font-size:12px">TP 3% / SL 1.5% / 30min</div></div>
+        <div class="metric-card"><div class="metric-label" data-i18n="ml_perp_equity">Perp Equity</div><div class="metric-value" id="okx-perp-equity">—</div></div>
+        <div class="metric-card"><div class="metric-label" data-i18n="ml_open_upl">Open UPL</div><div class="metric-value" id="okx-perp-upl">—</div></div>
+        <div class="metric-card"><div class="metric-label" data-i18n="ml_open_positions">Open Positions</div><div class="metric-value" id="okx-perp-positions-count">—</div></div>
+        <div class="metric-card"><div class="metric-label" data-i18n="ml_autoclose_rules">Auto-Close Rules</div><div class="metric-value" style="font-size:12px">TP 3% / SL 1.5% / 30min</div></div>
       </div>
       <div class="panel with-pad">
-        <div class="panel-header"><div class="panel-title"><span class="dot" style="background:var(--purple);box-shadow:0 0 6px var(--purple)"></span> Live Perp Positions</div></div>
+        <div class="panel-header"><div class="panel-title"><span class="dot" style="background:var(--purple);box-shadow:0 0 6px var(--purple)"></span> <span data-i18n="pt_live_perp">Live Perp Positions</span></div></div>
         <table class="data-table">
-          <thead><tr><th>Ticker</th><th>Side</th><th>Size</th><th>Entry Price</th><th>Mark Price</th><th>Leverage</th><th>UPL $</th><th>UPL %</th><th>Margin</th></tr></thead>
-          <tbody id="okx-perp-body"><tr><td colspan="9" class="empty-row">Loading...</td></tbody>
+          <thead><tr><th data-i18n="th_ticker">Ticker</th><th data-i18n="th_side">Side</th><th data-i18n="th_size">Size</th><th data-i18n="th_entry_price">Entry Price</th><th data-i18n="th_mark_price">Mark Price</th><th data-i18n="th_leverage">Leverage</th><th data-i18n="th_upl_usd">UPL $</th><th data-i18n="th_upl_pct">UPL %</th><th data-i18n="th_margin">Margin</th><th data-i18n="th_action">Action</th></tr></thead>
+          <tbody id="okx-perp-body"><tr><td colspan="10" class="empty-row" data-i18n="loading">Loading...</td></tbody>
         </table>
       </div>
       <div class="panel with-pad">
-        <div class="panel-header"><div class="panel-title"><span class="dot amber"></span> Auto-Close Rules Configuration</div><span class="panel-action" onclick="openPerpSettings()">Configure →</span></div>
+        <div class="panel-header"><div class="panel-title"><span class="dot amber"></span> <span data-i18n="pt_autoclose">Auto-Close Rules Configuration</span></div><span class="panel-action" onclick="openPerpSettings()" data-i18n="btn_configure">Configure →</span></div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;padding:8px 0">
-          <div style="background:var(--surface2);padding:12px;border-radius:4px"><div style="font-size:9px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em;margin-bottom:4px">Take Profit</div><div style="font-family:var(--mono);font-size:18px;color:var(--green)" id="perp-rule-tp">3.0%</div><div style="font-size:9px;color:var(--text-dim);margin-top:2px">Auto-close on profit</div></div>
-          <div style="background:var(--surface2);padding:12px;border-radius:4px"><div style="font-size:9px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em;margin-bottom:4px">Stop Loss</div><div style="font-family:var(--mono);font-size:18px;color:var(--red)" id="perp-rule-sl">1.5%</div><div style="font-size:9px;color:var(--text-dim);margin-top:2px">Auto-close on loss</div></div>
-          <div style="background:var(--surface2);padding:12px;border-radius:4px"><div style="font-size:9px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em;margin-bottom:4px">Max Hold Time</div><div style="font-family:var(--mono);font-size:18px;color:var(--amber)" id="perp-rule-hold">30 min</div><div style="font-size:9px;color:var(--text-dim);margin-top:2px">Force close after</div></div>
-          <div style="background:var(--surface2);padding:12px;border-radius:4px"><div style="font-size:9px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em;margin-bottom:4px">Status</div><div style="font-family:var(--mono);font-size:18px;color:var(--green)">ACTIVE</div><div style="font-size:9px;color:var(--text-dim);margin-top:2px">Auto-close enabled</div></div>
+          <div style="background:var(--surface2);padding:12px;border-radius:4px"><div style="font-size:9px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em;margin-bottom:4px" data-i18n="pr_tp">Take Profit</div><div style="font-family:var(--mono);font-size:18px;color:var(--green)" id="perp-rule-tp">3.0%</div><div style="font-size:9px;color:var(--text-dim);margin-top:2px" data-i18n="pr_tp_desc">Auto-close on profit</div></div>
+          <div style="background:var(--surface2);padding:12px;border-radius:4px"><div style="font-size:9px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em;margin-bottom:4px" data-i18n="pr_sl">Stop Loss</div><div style="font-family:var(--mono);font-size:18px;color:var(--red)" id="perp-rule-sl">1.5%</div><div style="font-size:9px;color:var(--text-dim);margin-top:2px" data-i18n="pr_sl_desc">Auto-close on loss</div></div>
+          <div style="background:var(--surface2);padding:12px;border-radius:4px"><div style="font-size:9px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em;margin-bottom:4px" data-i18n="pr_hold">Max Hold Time</div><div style="font-family:var(--mono);font-size:18px;color:var(--amber)" id="perp-rule-hold">30 min</div><div style="font-size:9px;color:var(--text-dim);margin-top:2px" data-i18n="pr_hold_desc">Force close after</div></div>
+          <div style="background:var(--surface2);padding:12px;border-radius:4px"><div style="font-size:9px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em;margin-bottom:4px" data-i18n="pr_status">Status</div><div style="font-family:var(--mono);font-size:18px;color:var(--green)" data-i18n="pr_active">ACTIVE</div><div style="font-size:9px;color:var(--text-dim);margin-top:2px" data-i18n="pr_status_desc">Auto-close enabled</div></div>
         </div>
       </div>
     </div><!-- /page-perp -->
@@ -914,31 +943,31 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
     <!-- ═══ KELLY PAGE ═══ -->
     <div class="page-section" id="page-kelly">
       <div class="page-header">
-        <div><div class="page-title-main">Kelly Criterion</div><div class="page-subtitle">Optimal position sizing based on win rate and payout ratio</div></div>
+        <div><div class="page-title-main" data-i18n="pg_kelly">Kelly Criterion</div><div class="page-subtitle" data-i18n="pg_kelly_sub">Optimal position sizing based on win rate and payout ratio</div></div>
       </div>
       <div class="grid-2">
         <div class="panel with-pad">
-          <div class="panel-header"><div class="panel-title"><span class="dot"></span> Kelly Calculator</div></div>
+          <div class="panel-header"><div class="panel-title"><span class="dot"></span> <span data-i18n="pt_kelly_calc">Kelly Calculator</span></div></div>
           <div style="display:flex;flex-direction:column;gap:12px;padding:8px 0">
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:11px;color:var(--text-dim)">Win Rate</span><span id="kelly-winrate-display" style="font-family:var(--mono);font-size:16px;font-weight:600">—</span></div>
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:11px;color:var(--text-dim)">Avg Win / Avg Loss</span><span id="kelly-payout-display" style="font-family:var(--mono);font-size:16px;font-weight:600">—</span></div>
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:11px;color:var(--text-dim)">Full Kelly %</span><span id="kelly-full-display" style="font-family:var(--mono);font-size:16px;font-weight:600;color:var(--cyan)">—</span></div>
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:11px;color:var(--text-dim)">Half Kelly (recommended)</span><span id="kelly-half-display" style="font-family:var(--mono);font-size:16px;font-weight:600;color:var(--green)">—</span></div>
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:11px;color:var(--text-dim)">Quarter Kelly (conservative)</span><span id="kelly-quarter-display" style="font-family:var(--mono);font-size:16px;font-weight:600;color:var(--amber)">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:11px;color:var(--text-dim)" data-i18n="ml_kelly_wr">Win Rate</span><span id="kelly-winrate-display" style="font-family:var(--mono);font-size:16px;font-weight:600">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:11px;color:var(--text-dim)" data-i18n="ml_kelly_payout">Avg Win / Avg Loss</span><span id="kelly-payout-display" style="font-family:var(--mono);font-size:16px;font-weight:600">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:11px;color:var(--text-dim)" data-i18n="ml_kelly_full">Full Kelly %</span><span id="kelly-full-display" style="font-family:var(--mono);font-size:16px;font-weight:600;color:var(--cyan)">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:11px;color:var(--text-dim)" data-i18n="ml_kelly_half">Half Kelly (recommended)</span><span id="kelly-half-display" style="font-family:var(--mono);font-size:16px;font-weight:600;color:var(--green)">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:11px;color:var(--text-dim)" data-i18n="ml_kelly_quarter">Quarter Kelly (conservative)</span><span id="kelly-quarter-display" style="font-family:var(--mono);font-size:16px;font-weight:600;color:var(--amber)">—</span></div>
             <hr style="border:none;border-top:1px solid var(--border);margin:4px 0">
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:11px;color:var(--text-dim)">Current Trade Size</span><span id="kelly-current-display" style="font-family:var(--mono);font-size:16px;font-weight:600">—</span></div>
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:11px;color:var(--text-dim)">Kelly Utilization</span><span id="kelly-util-display" style="font-family:var(--mono);font-size:16px;font-weight:600">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:11px;color:var(--text-dim)" data-i18n="ml_kelly_current">Current Trade Size</span><span id="kelly-current-display" style="font-family:var(--mono);font-size:16px;font-weight:600">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:11px;color:var(--text-dim)" data-i18n="ml_kelly_util">Kelly Utilization</span><span id="kelly-util-display" style="font-family:var(--mono);font-size:16px;font-weight:600">—</span></div>
           </div>
         </div>
         <div class="panel with-pad">
-          <div class="panel-header"><div class="panel-title"><span class="dot amber"></span> Trade Statistics</div></div>
+          <div class="panel-header"><div class="panel-title"><span class="dot amber"></span> <span data-i18n="pt_trade_stats">Trade Statistics</span></div></div>
           <div style="display:flex;flex-direction:column;gap:10px;padding:8px 0">
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em">Total Trades</span><span id="kelly-stat-total" style="font-family:var(--mono);font-size:14px">—</span></div>
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em">Wins</span><span id="kelly-stat-wins" style="font-family:var(--mono);font-size:14px;color:var(--green)">—</span></div>
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em">Losses</span><span id="kelly-stat-losses" style="font-family:var(--mono);font-size:14px;color:var(--red)">—</span></div>
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em">Profit Factor</span><span id="kelly-stat-pf" style="font-family:var(--mono);font-size:14px">—</span></div>
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em">Max Consecutive Wins</span><span id="kelly-stat-maxwin" style="font-family:var(--mono);font-size:14px">—</span></div>
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em">Max Consecutive Losses</span><span id="kelly-stat-maxloss" style="font-family:var(--mono);font-size:14px">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em" data-i18n="ml_total_trades">Total Trades</span><span id="kelly-stat-total" style="font-family:var(--mono);font-size:14px">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em" data-i18n="ml_kelly_wins">Wins</span><span id="kelly-stat-wins" style="font-family:var(--mono);font-size:14px;color:var(--green)">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em" data-i18n="ml_kelly_losses">Losses</span><span id="kelly-stat-losses" style="font-family:var(--mono);font-size:14px;color:var(--red)">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em" data-i18n="ml_kelly_pf">Profit Factor</span><span id="kelly-stat-pf" style="font-family:var(--mono);font-size:14px">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em" data-i18n="ml_kelly_maxwin">Max Consecutive Wins</span><span id="kelly-stat-maxwin" style="font-family:var(--mono);font-size:14px">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em" data-i18n="ml_kelly_maxloss">Max Consecutive Losses</span><span id="kelly-stat-maxloss" style="font-family:var(--mono);font-size:14px">—</span></div>
           </div>
         </div>
       </div>
@@ -947,11 +976,11 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
     <!-- ═══ REPORTS PAGE ═══ -->
     <div class="page-section" id="page-reports">
       <div class="page-header">
-        <div><div class="page-title-main">Reports</div><div class="page-subtitle">Performance analytics and trading statistics</div></div>
+        <div><div class="page-title-main" data-i18n="pg_reports">Reports</div><div class="page-subtitle" data-i18n="pg_reports_sub">Performance analytics and trading statistics</div></div>
       </div>
       <div class="grid-main-side">
         <div class="panel with-pad" style="padding:0">
-          <div class="panel-header"><div class="panel-title"><span class="dot"></span> Equity Curve</div>
+          <div class="panel-header"><div class="panel-title" data-i18n="equityCurve"><span class="dot"></span> Equity Curve</div>
             <div style="display:flex;gap:12px">
               <span class="panel-action" style="color:var(--cyan)">3H</span><span class="panel-action">4H</span>
               <span class="panel-action">1D</span><span class="panel-action">ALL</span>
@@ -960,33 +989,33 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
           <div class="chart-wrap"><canvas id="equity-report"></canvas></div>
         </div>
         <div class="panel with-pad">
-          <div class="panel-header"><div class="panel-title"><span class="dot amber"></span> Performance Summary</div></div>
+          <div class="panel-header"><div class="panel-title"><span class="dot amber"></span> <span data-i18n="pt_perf_summary">Performance Summary</span></div></div>
           <div style="display:flex;flex-direction:column;gap:10px;padding:8px 0">
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em">Total Trades</span><span id="rpt-stat-total" style="font-family:var(--mono);font-size:14px">—</span></div>
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em">Win Rate</span><span id="rpt-stat-winrate" style="font-family:var(--mono);font-size:14px;color:var(--green)">—</span></div>
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em">Total PnL</span><span id="rpt-stat-pnl" style="font-family:var(--mono);font-size:14px">—</span></div>
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em">Avg Trade PnL</span><span id="rpt-stat-avg" style="font-family:var(--mono);font-size:14px">—</span></div>
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em">Best Trade</span><span id="rpt-stat-best" style="font-family:var(--mono);font-size:14px;color:var(--green)">—</span></div>
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em">Worst Trade</span><span id="rpt-stat-worst" style="font-family:var(--mono);font-size:14px;color:var(--red)">—</span></div>
-            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em">Profit Factor</span><span id="rpt-stat-pf" style="font-family:var(--mono);font-size:14px">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em" data-i18n="ml_total_trades">Total Trades</span><span id="rpt-stat-total" style="font-family:var(--mono);font-size:14px">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em" data-i18n="ml_win_rate">Win Rate</span><span id="rpt-stat-winrate" style="font-family:var(--mono);font-size:14px;color:var(--green)">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em" data-i18n="ml_total_pnl">Total PnL</span><span id="rpt-stat-pnl" style="font-family:var(--mono);font-size:14px">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em" data-i18n="ml_rpt_avg">Avg Trade PnL</span><span id="rpt-stat-avg" style="font-family:var(--mono);font-size:14px">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em" data-i18n="ml_rpt_best">Best Trade</span><span id="rpt-stat-best" style="font-family:var(--mono);font-size:14px;color:var(--green)">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em" data-i18n="ml_rpt_worst">Worst Trade</span><span id="rpt-stat-worst" style="font-family:var(--mono);font-size:14px;color:var(--red)">—</span></div>
+            <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.08em" data-i18n="ml_kelly_pf">Profit Factor</span><span id="rpt-stat-pf" style="font-family:var(--mono);font-size:14px">—</span></div>
           </div>
         </div>
       </div>
       <div class="grid-full">
         <div class="panel with-pad" style="padding:0">
-          <div class="panel-header"><div class="panel-title"><span class="dot"></span> Trade Log</div>
+          <div class="panel-header"><div class="panel-title"><span class="dot"></span> <span data-i18n="pt_trade_log">Trade Log</span></div>
             <div style="display:flex;gap:8px;align-items:center">
               <select id="rpt-filter-platform" class="filter-search" style="width:80px" onchange="loadReportsPage()">
-                <option value="all">All Platforms</option>
+                <option value="all" data-i18n="all_platforms">All Platforms</option>
                 <option value="JUP">Jupiter</option>
                 <option value="OKX">OKX</option>
               </select>
-              <button class="topbar-btn" onclick="loadReportsPage()">Refresh</button>
+              <button class="topbar-btn" onclick="loadReportsPage()" data-i18n="btn_refresh">Refresh</button>
             </div>
           </div>
           <table class="data-table">
-            <thead><tr><th>ID</th><th>Time</th><th>Ticker</th><th>Side</th><th>Entry $</th><th>Exit $</th><th>PnL $</th><th>Mult</th><th>Platform</th><th>Why</th></tr></thead>
-            <tbody id="rpt-trades-body"><tr><td colspan="10" class="empty-row">Loading...</td></tr></tbody>
+            <thead><tr><th data-i18n="th_id">ID</th><th data-i18n="th_time">Time</th><th data-i18n="th_ticker">Ticker</th><th data-i18n="th_side">Side</th><th data-i18n="th_entry_usd">Entry $</th><th data-i18n="th_exit_usd">Exit $</th><th data-i18n="th_pnl_usd">PnL $</th><th data-i18n="th_mult">Mult</th><th data-i18n="th_platform">Platform</th><th data-i18n="th_why">Why</th></tr></thead>
+            <tbody id="rpt-trades-body"><tr><td colspan="10" class="empty-row" data-i18n="loading">Loading...</td></tr></tbody>
           </table>
           <div id="rpt-pager" class="pager-bar"></div>
         </div>
@@ -995,33 +1024,33 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
 
     <!-- ═══ LEADERBOARD PAGE ═══ -->
     <div class="page-section" id="page-leaderboard">
-      <div class="page-header"><div><div class="page-title-main">Profit Leaderboard</div><div class="page-subtitle">Top traders by total PnL</div></div><button class="btn-primary" onclick="syncLeaderboard()" id="sync-lb-btn">Sync My Stats</button></div>
-      <div id="leaderboard-login-msg" class="panel" style="text-align:center;padding:40px;display:none"><div style="font-size:13px;color:var(--text-dim);margin-bottom:12px">Please log in to sync your stats and appear on the leaderboard</div><button class="btn-primary" onclick="showAuthModal()">Log In / Register</button></div>
+      <div class="page-header"><div><div class="page-title-main" data-i18n="pg_leaderboard">Profit Leaderboard</div><div class="page-subtitle" data-i18n="pg_leaderboard_sub">Top traders by total PnL</div></div><button class="btn-primary" onclick="syncLeaderboard()" id="sync-lb-btn" data-i18n="btn_sync_stats">Sync My Stats</button></div>
+      <div id="leaderboard-login-msg" class="panel" style="text-align:center;padding:40px;display:none"><div style="font-size:13px;color:var(--text-dim);margin-bottom:12px" data-i18n="login_to_sync">Please log in to sync your stats and appear on the leaderboard</div><button class="btn-primary" onclick="showAuthModal()" data-i18n="am_login_register">Log In / Register</button></div>
       <div id="leaderboard-content" style="display:none">
         <div class="grid-3" id="lb-stats-cards"></div>
-        <div class="panel" style="margin-top:16px"><div class="panel-header"><div class="panel-title"><span class="dot green"></span> Top Traders</div></div>
-          <div class="table-wrap"><table class="data-table"><thead><tr><th>#</th><th>Trader</th><th>Tier</th><th>Total PnL</th><th>Trades</th><th>Win Rate</th></tr></thead><tbody id="lb-tbody"></tbody></table></div>
+        <div class="panel" style="margin-top:16px"><div class="panel-header"><div class="panel-title"><span class="dot green"></span> <span data-i18n="pt_top_traders">Top Traders</span></div></div>
+          <div class="table-wrap"><table class="data-table"><thead><tr><th data-i18n="th_no">#</th><th data-i18n="th_trader">Trader</th><th data-i18n="th_tier">Tier</th><th data-i18n="th_total_pnl">Total PnL</th><th data-i18n="th_trades">Trades</th><th data-i18n="th_win_rate">Win Rate</th></tr></thead><tbody id="lb-tbody"></tbody></table></div>
         </div>
       </div>
-      <div id="leaderboard-loading" class="panel" style="text-align:center;padding:40px"><div class="spinner"></div><div style="margin-top:8px;font-size:11px;color:var(--text-dim)">Loading leaderboard...</div></div>
+      <div id="leaderboard-loading" class="panel" style="text-align:center;padding:40px"><div class="spinner"></div><div style="margin-top:8px;font-size:11px;color:var(--text-dim)" data-i18n="loading_lb">Loading leaderboard...</div></div>
     </div><!-- /page-leaderboard -->
 
     <!-- ═══ MEMBERS / USER CENTER PAGE ═══ -->
     <div class="page-section" id="page-members">
-      <div class="page-header"><div><div class="page-title-main" data-i18n="nav_members">Members</div><div class="page-subtitle" id="members-subtitle">Log in to continue</div></div></div>
+      <div class="page-header"><div><div class="page-title-main" data-i18n="nav_members">Members</div><div class="page-subtitle" id="members-subtitle" data-i18n="pg_members_sub">Log in to continue</div></div></div>
 
       <!-- Login prompt -->
-      <div id="members-login-msg" class="panel" style="text-align:center;padding:40px"><div style="font-size:13px;color:var(--text-dim);margin-bottom:12px" data-i18n="login_required">Please log in to access your member center</div><button class="btn-primary" onclick="showAuthModal()">Log In</button></div>
+      <div id="members-login-msg" class="panel" style="text-align:center;padding:40px"><div style="font-size:13px;color:var(--text-dim);margin-bottom:12px" data-i18n="login_to_members">Please log in to access your member center</div><button class="btn-primary" onclick="showAuthModal()" data-i18n="am_log_in">Log In</button></div>
 
       <!-- Admin panel (admin users only) -->
       <div id="members-admin-panel" style="display:none">
-        <div class="panel"><div class="panel-header"><div class="panel-title"><span class="dot blue"></span> All Members</div><button class="btn-secondary" onclick="loadMembersPage()">Refresh</button></div>
-          <div class="table-wrap"><table class="data-table"><thead><tr><th>ID</th><th>Username</th><th>Email</th><th>Role</th><th>Tier</th><th>Registered</th><th>Last Login</th><th>Actions</th></tr></thead><tbody id="members-tbody"></tbody></table></div>
+        <div class="panel"><div class="panel-header"><div class="panel-title"><span class="dot blue"></span> <span data-i18n="pt_all_members">All Members</span></div><button class="btn-secondary" onclick="loadMembersPage()" data-i18n="btn_refresh">Refresh</button></div>
+          <div class="table-wrap"><table class="data-table"><thead><tr><th data-i18n="th_id">ID</th><th data-i18n="th_username">Username</th><th data-i18n="th_email">Email</th><th data-i18n="th_role">Role</th><th data-i18n="th_tier">Tier</th><th data-i18n="th_registered">Registered</th><th data-i18n="th_last_login">Last Login</th><th data-i18n="th_actions">Actions</th></tr></thead><tbody id="members-tbody"></tbody></table></div>
         </div>
-        <div class="panel" style="margin-top:16px"><div class="panel-header"><div class="panel-title"><span class="dot amber"></span> Quick Actions</div></div>
+        <div class="panel" style="margin-top:16px"><div class="panel-header"><div class="panel-title"><span class="dot amber"></span> <span data-i18n="pt_quick_actions">Quick Actions</span></div></div>
           <div style="display:flex;gap:8px;flex-wrap:wrap">
-            <button class="btn-secondary" onclick="resetAllLeaderboard()">Reset Leaderboard</button>
-            <button class="btn-secondary" onclick="grantAllFreeToPremium()">Bulk Upgrade to Premium</button>
+            <button class="btn-secondary" onclick="resetAllLeaderboard()" data-i18n="btn_reset_lb">Reset Leaderboard</button>
+            <button class="btn-secondary" onclick="grantAllFreeToPremium()" data-i18n="btn_bulk_upgrade">Bulk Upgrade to Premium</button>
           </div>
         </div>
       </div>
@@ -1095,11 +1124,15 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
                   </div>
                 </div>
               </div>
-              <!-- Max Position -->
+              <!-- Per-trade amount band: min / max -->
               <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
                 <div>
-                  <label style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.1em;font-family:var(--mono);display:block;margin-bottom:6px"><span data-i18n="max_position_usd">Max Position per Trade (USD)</span></label>
-                  <input id="us-max-position" type="number" value="100" min="10" max="10000" step="10" style="width:120px;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:3px;font-size:12px;font-family:var(--mono)">
+                  <label style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.1em;font-family:var(--mono);display:block;margin-bottom:6px" class="has-tip" data-tip="低于该金额的开仓信号会被自动上调到下限（OKX 单笔最小 $10）"><span data-i18n="min_trade_usd">Min per Trade (USD)</span></label>
+                  <input id="us-min-trade" type="number" value="10" min="0" max="1000000" step="1" style="width:120px;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:3px;font-size:12px;font-family:var(--mono)">
+                </div>
+                <div>
+                  <label style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.1em;font-family:var(--mono);display:block;margin-bottom:6px" class="has-tip" data-tip="高于该金额的开仓信号会被自动压到上限。平仓不受此限制，确保任何仓位都能退出"><span data-i18n="max_position_usd">Max per Trade (USD)</span></label>
+                  <input id="us-max-position" type="number" value="100" min="1" max="1000000" step="10" style="width:120px;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:3px;font-size:12px;font-family:var(--mono)">
                 </div>
                 <div>
                   <label style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.1em;font-family:var(--mono);display:block;margin-bottom:6px"><span data-i18n="take_profit">Take Profit (%)</span></label>
@@ -1110,18 +1143,21 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
                   <input id="us-stop-loss" type="number" value="1.5" min="0.1" max="50" step="0.1" style="width:100px;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:3px;font-size:12px;font-family:var(--mono)">
                 </div>
               </div>
+              <div id="us-band-hint" style="font-size:10px;color:var(--text-dim);font-family:var(--mono);line-height:1.6;padding:6px 0 0">
+                <span data-i18n="bandHint">单笔金额区间只作用于「开仓」下单金额；一键平仓与止损/止盈平仓不受区间限制。</span>
+              </div>
               <!-- Allowed Tickers Multi-Select -->
               <div>
-                <label style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.1em;font-family:var(--mono);display:block;margin-bottom:6px"><span data-i18n="allowed_tickers">Filter Tickers</span> <span style="color:var(--text-dim);opacity:.6;text-transform:none;letter-spacing:0;font-size:9px">(leave empty = no filter)</span></label>
+                <label style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.1em;font-family:var(--mono);display:block;margin-bottom:6px"><span data-i18n="allowed_tickers">Filter Tickers</span> <span style="color:var(--text-dim);opacity:.6;text-transform:none;letter-spacing:0;font-size:9px" data-i18n="leave_empty">(leave empty = no filter)</span></label>
                 <div id="ticker-picker-container" style="position:relative">
                   <div id="us-ticker-input" class="ticker-picker-trigger" onclick="toggleTickerPicker()" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:3px;margin-top:4px;font-size:12px;cursor:text;min-height:32px;display:flex;align-items:center;flex-wrap:wrap;gap:4px">
-                    <span style="color:var(--text-dim);font-size:11px" id="ticker-placeholder">Click to select coins...</span>
+                    <span style="color:var(--text-dim);font-size:11px" id="ticker-placeholder" data-i18n="click_select_coins">Click to select coins...</span>
                   </div>
                   <div id="us-ticker-dropdown" style="display:none;position:absolute;top:100%;left:0;right:0;background:var(--surface);border:1px solid var(--border);border-radius:3px;margin-top:2px;z-index:100;max-height:240px;overflow-y:auto">
                     <div style="padding:8px;border-bottom:1px solid var(--border);display:flex;gap:6px;align-items:center">
-                      <button onclick="selectAllTickers()" style="font-size:9px;padding:2px 8px;background:var(--cyan);color:var(--bg);border:none;border-radius:2px;cursor:pointer;font-family:var(--mono);text-transform:uppercase">All</button>
-                      <button onclick="clearAllTickers()" style="font-size:9px;padding:2px 8px;background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:2px;cursor:pointer;font-family:var(--mono);text-transform:uppercase">Clear</button>
-                      <input id="ticker-search" type="text" placeholder="Search..." oninput="filterTickers(this.value)" style="margin-left:auto;background:transparent;border:1px solid var(--border);color:var(--text);padding:3px 8px;border-radius:2px;font-size:11px;width:120px">
+                      <button onclick="selectAllTickers()" style="font-size:9px;padding:2px 8px;background:var(--cyan);color:var(--bg);border:none;border-radius:2px;cursor:pointer;font-family:var(--mono);text-transform:uppercase" data-i18n="btn_all">All</button>
+                      <button onclick="clearAllTickers()" style="font-size:9px;padding:2px 8px;background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:2px;cursor:pointer;font-family:var(--mono);text-transform:uppercase" data-i18n="btn_clear_sel">Clear</button>
+                      <input id="ticker-search" type="text" placeholder="Search..." data-i18n-ph="search" oninput="filterTickers(this.value)" style="margin-left:auto;background:transparent;border:1px solid var(--border);color:var(--text);padding:3px 8px;border-radius:2px;font-size:11px;width:120px">
                     </div>
                     <div id="ticker-list" style="padding:6px;display:grid;grid-template-columns:repeat(4,1fr);gap:4px"></div>
                   </div>
@@ -1160,21 +1196,21 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
     <div id="auth-modal" class="modal-overlay" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.7);align-items:center;justify-content:center">
       <div class="modal-box" style="max-width:400px">
         <button class="close-btn" onclick="closeAuthModal()">✕</button>
-        <h2 id="auth-modal-title">Login</h2>
+        <h2 id="auth-modal-title" data-i18n="am_log_in">Login</h2>
         <div id="auth-tabs" style="display:flex;gap:0;margin-bottom:16px;border-bottom:1px solid var(--border)">
-          <div id="tab-login" style="flex:1;text-align:center;padding:8px;cursor:pointer;color:var(--green);border-bottom:2px solid var(--green)" onclick="switchAuthTab('login')">Login</div>
-          <div id="tab-register" style="flex:1;text-align:center;padding:8px;cursor:pointer;color:var(--text-dim)" onclick="switchAuthTab('register')">Register</div>
+          <div id="tab-login" style="flex:1;text-align:center;padding:8px;cursor:pointer;color:var(--green);border-bottom:2px solid var(--green)" onclick="switchAuthTab('login')" data-i18n="am_log_in">Login</div>
+          <div id="tab-register" style="flex:1;text-align:center;padding:8px;cursor:pointer;color:var(--text-dim)" onclick="switchAuthTab('register')" data-i18n="btn_register">Register</div>
         </div>
         <div id="auth-login-form">
-          <div style="margin-bottom:12px"><label style="font-size:10px;color:var(--text-dim)">Username</label><input id="auth-login-user" type="text" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:2px;margin-top:4px"></div>
-          <div style="margin-bottom:12px"><label style="font-size:10px;color:var(--text-dim)">Password</label><input id="auth-login-pass" type="password" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:2px;margin-top:4px"></div>
-          <button class="btn-primary" onclick="doLogin()" style="width:100%">Login</button>
+          <div style="margin-bottom:12px"><label style="font-size:10px;color:var(--text-dim)" data-i18n="am_username">Username</label><input id="auth-login-user" type="text" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:2px;margin-top:4px"></div>
+          <div style="margin-bottom:12px"><label style="font-size:10px;color:var(--text-dim)" data-i18n="am_password">Password</label><input id="auth-login-pass" type="password" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:2px;margin-top:4px"></div>
+          <button class="btn-primary" onclick="doLogin()" style="width:100%" data-i18n="am_log_in">Login</button>
         </div>
         <div id="auth-register-form" style="display:none">
-          <div style="margin-bottom:12px"><label style="font-size:10px;color:var(--text-dim)">Username</label><input id="auth-reg-user" type="text" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:2px;margin-top:4px"></div>
-          <div style="margin-bottom:12px"><label style="font-size:10px;color:var(--text-dim)">Password</label><input id="auth-reg-pass" type="password" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:2px;margin-top:4px"></div>
-          <div style="margin-bottom:12px"><label style="font-size:10px;color:var(--text-dim)">Email (optional)</label><input id="auth-reg-email" type="email" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:2px;margin-top:4px"></div>
-          <button class="btn-primary" onclick="doRegister()" style="width:100%">Register</button>
+          <div style="margin-bottom:12px"><label style="font-size:10px;color:var(--text-dim)" data-i18n="am_username">Username</label><input id="auth-reg-user" type="text" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:2px;margin-top:4px"></div>
+          <div style="margin-bottom:12px"><label style="font-size:10px;color:var(--text-dim)" data-i18n="am_password">Password</label><input id="auth-reg-pass" type="password" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:2px;margin-top:4px"></div>
+          <div style="margin-bottom:12px"><label style="font-size:10px;color:var(--text-dim)" data-i18n="am_email">Email (optional)</label><input id="auth-reg-email" type="email" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:2px;margin-top:4px"></div>
+          <button class="btn-primary" onclick="doRegister()" style="width:100%" data-i18n="btn_register">Register</button>
         </div>
         <div id="auth-msg" style="margin-top:12px;font-size:11px;text-align:center"></div>
       </div>
@@ -1184,20 +1220,20 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
     <div id="member-edit-modal" class="modal-overlay" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.7);align-items:center;justify-content:center">
       <div class="modal-box" style="max-width:360px">
         <button class="close-btn" onclick="closeMemberEdit()">✕</button>
-        <h2>Edit Member</h2>
+        <h2 data-i18n="am_edit_member">Edit Member</h2>
         <input type="hidden" id="edit-member-id">
-        <div style="margin-bottom:12px"><label style="font-size:10px;color:var(--text-dim)">Role</label>
+        <div style="margin-bottom:12px"><label style="font-size:10px;color:var(--text-dim)" data-i18n="am_role">Role</label>
           <select id="edit-member-role" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:2px;margin-top:4px">
-            <option value="user">User</option><option value="admin">Admin</option>
+            <option value="user" data-i18n="am_user">User</option><option value="admin" data-i18n="am_admin">Admin</option>
           </select>
         </div>
-        <div style="margin-bottom:12px"><label style="font-size:10px;color:var(--text-dim)">Tier</label>
+        <div style="margin-bottom:12px"><label style="font-size:10px;color:var(--text-dim)" data-i18n="am_tier">Tier</label>
           <select id="edit-member-tier" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:2px;margin-top:4px">
-            <option value="free">Free</option><option value="premium">Premium</option>
+            <option value="free" data-i18n="am_free">Free</option><option value="premium" data-i18n="am_premium">Premium</option>
           </select>
         </div>
-        <button class="btn-primary" onclick="saveMemberEdit()" style="width:100%">Save</button>
-        <button class="btn-secondary" onclick="deleteMember()" style="width:100%;margin-top:8px;color:var(--red);border-color:var(--red)">Delete Member</button>
+        <button class="btn-primary" onclick="saveMemberEdit()" style="width:100%" data-i18n="save">Save</button>
+        <button class="btn-secondary" onclick="deleteMember()" style="width:100%;margin-top:8px;color:var(--red);border-color:var(--red)" data-i18n="btn_delete_member">Delete Member</button>
       </div>
     </div>
 
@@ -1205,33 +1241,33 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
     <div id="perp-settings-modal" class="modal-overlay" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.7);align-items:center;justify-content:center">
       <div class="modal-box" style="max-width:480px">
         <button class="close-btn" onclick="closePerpSettings()">✕</button>
-        <h2>Perp Auto-Close Settings</h2>
-        <div style="font-size:11px;color:var(--text-dim);margin-bottom:16px">Configure automatic position closing rules for perpetual futures</div>
+        <h2 data-i18n="pm_title">Perp Auto-Close Settings</h2>
+        <div style="font-size:11px;color:var(--text-dim);margin-bottom:16px" data-i18n="pm_sub">Configure automatic position closing rules for perpetual futures</div>
         <div style="display:flex;flex-direction:column;gap:12px">
           <div>
-            <label style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em">Take Profit Threshold (%)</label>
+            <label style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em" data-i18n="pm_tp">Take Profit Threshold (%)</label>
             <input id="perp-tp" type="number" step="0.1" value="3" data-default="3" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 10px;font-family:var(--mono);border-radius:2px;margin-top:4px;font-size:13px">
           </div>
           <div>
-            <label style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em">Stop Loss Threshold (%)</label>
+            <label style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em" data-i18n="pm_sl">Stop Loss Threshold (%)</label>
             <input id="perp-sl" type="number" step="0.1" value="1.5" data-default="1.5" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 10px;font-family:var(--mono);border-radius:2px;margin-top:4px;font-size:13px">
           </div>
           <div>
-            <label style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em">Max Hold Time (seconds)</label>
+            <label style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em" data-i18n="pm_hold">Max Hold Time (seconds)</label>
             <input id="perp-max-hold" type="number" value="1800" data-default="1800" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 10px;font-family:var(--mono);border-radius:2px;margin-top:4px;font-size:13px">
           </div>
           <div>
-            <label style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em">Max Position Size (USD)</label>
+            <label style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em" data-i18n="pm_maxsize">Max Position Size (USD)</label>
             <input id="perp-max-size" type="number" value="1000" data-default="1000" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 10px;font-family:var(--mono);border-radius:2px;margin-top:4px;font-size:13px">
           </div>
           <div style="display:flex;align-items:center;gap:10px;padding:8px 0">
             <input id="perp-reopen" type="checkbox" checked data-default="true" style="width:16px;height:16px;cursor:pointer">
-            <label style="font-size:12px;color:var(--text)">Allow same-coin re-entry after close</label>
+            <label style="font-size:12px;color:var(--text)" data-i18n="pm_reopen">Allow same-coin re-entry after close</label>
           </div>
         </div>
         <div class="modal-footer" style="margin-top:16px">
-          <button class="btn-secondary" onclick="closePerpSettings()">Cancel</button>
-          <button class="btn-primary" onclick="savePerpSettings()">Save Settings</button>
+          <button class="btn-secondary" onclick="closePerpSettings()" data-i18n="btn_cancel">Cancel</button>
+          <button class="btn-primary" onclick="savePerpSettings()" data-i18n="btn_save_settings">Save Settings</button>
         </div>
       </div>
     </div>
@@ -1243,24 +1279,114 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
 // === i18n ===
 const I18N = {
   en: {
+    // ── topbar / dashboard metrics ──
     hint:"OKX Spot & Futures · AI Auto Trading",
     liveMonitor:"📡 Live Monitor", multiple:"Multiple", bankroll:"Bankroll",
     entries:"Entries", winsLosses:"Wins / Losses", pendingSwaps:"Pending Swaps",
     submittedSwaps:"Submitted", solPrice:"SOL Price", deskState:"Desk State",
-    todayPnl:"Today P&L", aiMode:"AI Mode",
+    todayPnl:"24h PnL", aiMode:"AI Mode",
+    ml_open_positions:"Open Positions", ml_kelly_fraction:"Kelly Fraction", ml_builder_code:"Builder Code",
+    comm_returned:"Comm returned",
+    // ── panels ──
+    equityCurve:"Equity Curve",
     equityTitle:"Equity (USD) · log scale · scroll window",
-    swapsTitle:"🔗 Swap Bundles", side:"Side", ticker:"Ticker",
-    amountUsd:"Amount $", feeUsd:"Fee $", impact:"Impact", output:"Out (est)", action:"Action",
-    positionsTitle:"Open Positions", entryTime:"Entry Time", entryPrice:"Buy Price", entryUsd:"Entry $",
+    swapsTitle:"Swap Bundles", positionsTitle:"Open Positions",
+    historyTitle:"History Trades", perpPositionsTitle:"Perpetual Positions",
+    strategySignals:"Strategy Signals", aiDecisions:"AI Decisions",
+    pt_spot_positions:"OKX Spot Positions", pt_perp_positions:"OKX Perp Positions",
+    pt_spot_holdings:"Spot Holdings", pt_spot_trades:"Recent Spot Trades",
+    pt_live_perp:"Live Perp Positions", pt_autoclose:"Auto-Close Rules Configuration",
+    pt_kelly_calc:"Kelly Calculator", pt_trade_stats:"Trade Statistics",
+    pt_perf_summary:"Performance Summary", pt_trade_log:"Trade Log",
+    pt_top_traders:"Top Traders", pt_all_members:"All Members", pt_quick_actions:"Quick Actions",
+    // ── table headers ──
+    side:"Side", ticker:"Ticker", amountUsd:"Amount $", feeUsd:"Fee $",
+    impact:"Impact", output:"Out (est)", action:"Action",
+    entryTime:"Entry", entryPrice:"Buy Price", entryUsd:"Entry $",
     peakMult:"Peak", currentMult:"Current", sizeFrac:"Size%",
-    historyTitle:"History Trades", exitTime:"Exit Time", exitUsd:"Sell $",
-    buyPrice:"Buy Price", sellPrice:"Sell Price",
+    exitTime:"Sell", exitUsd:"Sell $", buyPrice:"Buy", sellPrice:"Sell",
     pnlMult:"P/L", pnlUsd:"Realized", why:"Why",
+    th_ticker:"Ticker", th_side:"Side", th_entry:"Entry", th_buy_usd:"Buy $",
+    th_peak:"Peak", th_current:"Current", th_size_pct:"Size%",
+    th_buy:"Buy", th_sell:"Sell", th_pl:"P/L", th_realized:"Realized",
+    th_amount_usd:"Amount $", th_fee_usd:"Fee $", th_impact:"Impact",
+    th_out_est:"Out (est)", th_action:"Action",
+    th_entry_usd:"Entry $", th_current_usd:"Current $", th_notional:"Notional",
+    th_leverage:"Leverage", th_pnl_usd:"PnL $", th_pnl_pct:"PnL %", th_elapsed:"Elapsed",
+    th_qty:"Qty", th_avg_usd:"Avg $", th_size:"Size", th_entry_price:"Entry Price",
+    th_mark_price:"Mark Price", th_upl_usd:"UPL $", th_upl_pct:"UPL %", th_margin:"Margin",
+    th_id:"ID", th_mult:"Mult", th_win:"Win", th_platform:"Platform", th_why:"Why", th_time:"Time",
+    th_asset:"Asset", th_total:"Total", th_available:"Available", th_locked:"Locked",
+    th_usdt_value:"USDT Value", th_pair:"Pair", th_exec_price:"Exec Price",
+    th_amount:"Amount", th_filled:"Filled", th_fee:"Fee",
+    th_no:"#", th_trader:"Trader", th_tier:"Tier", th_total_pnl:"Total PnL",
+    th_trades:"Trades", th_win_rate:"Win Rate",
+    th_username:"Username", th_email:"Email", th_role:"Role", th_registered:"Registered",
+    th_last_login:"Last Login", th_actions:"Actions",
+    // ── page titles ──
+    pg_positions:"Positions", pg_positions_sub:"Live spot & perpetual positions across all platforms",
+    pg_trades:"Trade History", pg_trades_sub:"Persistent trade records from database",
+    pg_trades_sub_okx:"Realized round trips on the OKX trading account \u2014 paired from /trade/fills",
+    tip_paper_replay:"Paper replay \u2014 no OKX order was placed",
+    pg_spot:"OKX Spot", pg_spot_sub:"Spot trading & balance management",
+    pg_perp:"Perp Engine", pg_perp_sub:"Perpetual futures trading with auto risk controls",
+    pg_kelly:"Kelly Criterion", pg_kelly_sub:"Optimal position sizing based on win rate and payout ratio",
+    pg_reports:"Reports", pg_reports_sub:"Performance analytics and trading statistics",
+    pg_leaderboard:"Profit Leaderboard", pg_leaderboard_sub:"Top traders by total PnL",
+    pg_members_sub:"Log in to continue",
+    // ── metric labels ──
+    ml_total_trades:"Total Trades", ml_win_rate:"Win Rate", ml_total_pnl:"Total PnL",
+    ml_avg_pnl:"Avg PnL/Trade",
+    ml_spot_equity:"Total Equity (USD)", ml_spot_avail:"Available USDT", ml_spot_holdings:"Holdings Value",
+    ml_perp_equity:"Perp Equity", ml_open_upl:"Open UPL", ml_autoclose_rules:"Auto-Close Rules",
+    ml_kelly_wr:"Win Rate", ml_kelly_payout:"Avg Win / Avg Loss",
+    ml_kelly_full:"Full Kelly %", ml_kelly_half:"Half Kelly (recommended)",
+    ml_kelly_quarter:"Quarter Kelly (conservative)", ml_kelly_current:"Current Trade Size",
+    ml_kelly_util:"Kelly Utilization",
+    ml_kelly_wins:"Wins", ml_kelly_losses:"Losses", ml_kelly_pf:"Profit Factor",
+    ml_kelly_maxwin:"Max Consecutive Wins", ml_kelly_maxloss:"Max Consecutive Losses",
+    ml_rpt_avg:"Avg Trade PnL", ml_rpt_best:"Best Trade", ml_rpt_worst:"Worst Trade",
+    // ── perp rules ──
+    pr_tp:"Take Profit", pr_sl:"Stop Loss", pr_hold:"Max Hold Time", pr_status:"Status",
+    pr_tp_desc:"Auto-close on profit", pr_sl_desc:"Auto-close on loss",
+    pr_hold_desc:"Force close after", pr_status_desc:"Auto-close enabled", pr_active:"ACTIVE",
+    // ── buttons ──
+    btn_refresh:"Refresh", btn_clear:"Clear", btn_view_all:"View All →",
+    btn_configure:"Configure →", btn_cancel:"Cancel", btn_save_settings:"Save Settings",
+    btn_delete_member:"Delete Member", btn_login:"Login", btn_register:"Register",
+    btn_sync_stats:"Sync My Stats", btn_reset_lb:"Reset Leaderboard",
+    btn_bulk_upgrade:"Bulk Upgrade to Premium", btn_send:"SEND", btn_all:"All",
+    btn_clear_sel:"Clear", btn_logout:"Logout",
+    // ── modals ──
+    am_edit_member:"Edit Member", am_role:"Role", am_tier:"Tier", am_user:"User", am_admin:"Admin",
+    am_free:"Free", am_premium:"Premium", am_username:"Username", am_password:"Password",
+    am_email:"Email (optional)", am_login_register:"Log In / Register", am_log_in:"Log In",
+    pm_title:"Perp Auto-Close Settings",
+    pm_sub:"Configure automatic position closing rules for perpetual futures",
+    pm_tp:"Take Profit Threshold (%)", pm_sl:"Stop Loss Threshold (%)",
+    pm_hold:"Max Hold Time (seconds)", pm_maxsize:"Max Position Size (USD)",
+    pm_reopen:"Allow same-coin re-entry after close",
+    mr_ticker:"Ticker:", mr_side:"Side:", mr_usd:"USD:",
+    // ── states / empty rows ──
+    loading:"Loading...", no_recent_trades:"No recent trades",
+    waiting_signals:"— waiting for signals —", no_open_positions:"— no open positions —",
+    no_history_yet:"— no history yet —", no_ai_decisions:"— no AI decisions yet —",
+    no_pending_swaps:"— no pending swaps —", no_perp_positions:"— no perpetual positions —",
+    no_spot_positions:"— no spot positions —", no_perp_positions_short:"— no perp positions —",
+    login_to_sync:"Please log in to sync your stats and appear on the leaderboard",
+    login_to_members:"Please log in to access your member center",
+    loading_lb:"Loading leaderboard...", all_platforms:"All Platforms",
+    trades_count:"trades", search_ticker:"Search ticker...", search:"Search...",
+    click_select_coins:"Click to select coins...", leave_empty:"(leave empty = no filter)",
+    // ── trade settings ──
     deskStatus:"Desk status", state:"state", theme:"theme",
     enteredRejected:"entered / rejected", expectancy:"expectancy",
     kelly:"full / used Kelly", currentOpen:"current open",
     feed:"Signal Feed", idle:"idle", running:"running", done:"done",
     noData:"No data", noOpen:"— no open positions —", noHistory:"— no closed trades yet —",
+    min_trade_usd:"Min per Trade (USD)", max_position_usd:"Max per Trade (USD)",
+    bandHint:"The per-trade amount band applies to OPENING orders only. One-click close and TP/SL exits are never blocked by it.",
+    closePos:"Close", closeAll:"Close all", perTradeLimit:"Per-trade",
     submit:"Submit", submitted:"Submitted", failed:"Failed", pending:"Pending",
     connectWallet:"Connect Wallet", disconnect:"Disconnect", connected:"Connected",
     manualSignal:"Manual Signal Test",
@@ -1293,6 +1419,23 @@ const I18N = {
     strat_t1:"All trades execute via your own OKX API — funds stay in your account.",
     strat_t2:"Historical trades and equity curve are publicly visible in real time.",
     strat_t3:"No profit promises. Past performance does not indicate future results. Trading involves risk.",
+    // ── member centre / trade settings ──
+    trade_settings:"Trade Settings", api_key_management:"API Key Management",
+    risk_preference:"Risk Preference", trade_mode:"Trade Mode",
+    signal_only:"Signal Only", signal_only_desc:"AI gives suggestions, you confirm manually",
+    auto_exec:"Auto Execute", auto_exec_desc:"AI places orders directly",
+    take_profit:"Take Profit (%)", stop_loss:"Stop Loss (%)",
+    allowed_tickers:"Filter Tickers", runtime:"Running Time", unlimited:"Unlimited (24h)",
+    save:"Save", configured:"Configured", not_configured:"Not configured",
+    api_key:"API Key", api_secret:"API Secret", api_passphrase:"API Passphrase",
+    th_exit_usd:"Exit $", th_type:"Type", th_pnl_short:"PnL",
+    // ── side / result badges (data values rendered into the UI) ──
+    side_entry:"ENTRY", side_exit:"EXIT", side_stop:"STOP", side_halt:"HALTED",
+    side_reject:"BLOCKED", side_skip:"SKIP",
+    side_long:"LONG", side_short:"SHORT", side_buy:"BUY", side_sell:"SELL",
+    badge_win:"WIN", badge_loss:"LOSS",
+    pt_okx_trade_history:"OKX Trade History", auto_badge:"auto",
+    mr_entry:"ENTRY (BUY)", mr_exit:"EXIT (SELL)",
     // Navigation
     nav_overview:"Overview", nav_dashboard:"Dashboard", nav_positions:"Positions", nav_trades:"Trades",
     nav_engine:"Engine", nav_spot:"OKX Spot", nav_perp:"Perp Engine",
@@ -1300,24 +1443,114 @@ const I18N = {
     nav_community:"Community", nav_leaderboard:"Leaderboard", nav_members:"Members",
   },
   zh: {
+    // ── topbar / dashboard metrics ──
     hint:"OKX 现货/合约 · AI 自动交易",
     liveMonitor:"📡 实时监视器", multiple:"倍数", bankroll:"可用资金",
     entries:"入场次数", winsLosses:"胜 / 负", pendingSwaps:"待签名",
     submittedSwaps:"已提交", solPrice:"SOL 价格", deskState:"运行状态",
-    todayPnl:"今日盈亏", aiMode:"AI 模式",
+    todayPnl:"24小时盈亏", aiMode:"AI 模式",
+    ml_open_positions:"当前持仓", ml_kelly_fraction:"Kelly 系数", ml_builder_code:"渠道代码",
+    comm_returned:"已返佣金",
+    // ── panels ──
+    equityCurve:"净值曲线",
     equityTitle:"净值曲线 (USD) · 对数刻度 · 滚动窗口",
-    swapsTitle:"🔗 Swap 交易包", side:"方向", ticker:"币种",
-    amountUsd:"金额 $", feeUsd:"手续费 $", impact:"滑点影响", output:"预期输出", action:"操作",
-    positionsTitle:"当前持仓", entryTime:"入场时间", entryPrice:"买入价格", entryUsd:"入场 $",
+    swapsTitle:"Swap 交易包", positionsTitle:"当前持仓",
+    historyTitle:"历史交易", perpPositionsTitle:"永续合约持仓",
+    strategySignals:"策略信号", aiDecisions:"AI 决策",
+    pt_spot_positions:"OKX 现货持仓", pt_perp_positions:"OKX 合约持仓",
+    pt_spot_holdings:"现货持仓明细", pt_spot_trades:"最近现货成交",
+    pt_live_perp:"实时合约持仓", pt_autoclose:"自动平仓规则配置",
+    pt_kelly_calc:"Kelly 计算器", pt_trade_stats:"交易统计",
+    pt_perf_summary:"绩效汇总", pt_trade_log:"交易明细",
+    pt_top_traders:"交易高手榜", pt_all_members:"全部会员", pt_quick_actions:"快捷操作",
+    // ── table headers ──
+    side:"方向", ticker:"币种", amountUsd:"金额 $", feeUsd:"手续费 $",
+    impact:"滑点影响", output:"预期输出", action:"操作",
+    entryTime:"入场", entryPrice:"买入价格", entryUsd:"入场 $",
     peakMult:"峰值", currentMult:"当前", sizeFrac:"仓位%",
-    historyTitle:"历史交易", exitTime:"出场时间", exitUsd:"卖出 $",
-    buyPrice:"买入价格", sellPrice:"卖出价格",
-    pnlMult:"盈亏倍率", pnlUsd:"已实现", why:"原因",
+    exitTime:"卖出", exitUsd:"卖出 $", buyPrice:"买入", sellPrice:"卖出",
+    pnlMult:"盈亏", pnlUsd:"已实现", why:"原因",
+    th_ticker:"币种", th_side:"方向", th_entry:"入场", th_buy_usd:"买入 $",
+    th_peak:"峰值", th_current:"当前", th_size_pct:"仓位%",
+    th_buy:"买入", th_sell:"卖出", th_pl:"盈亏", th_realized:"已实现",
+    th_amount_usd:"金额 $", th_fee_usd:"手续费 $", th_impact:"滑点影响",
+    th_out_est:"预期输出", th_action:"操作",
+    th_entry_usd:"入场 $", th_current_usd:"当前 $", th_notional:"名义价值",
+    th_leverage:"杠杆", th_pnl_usd:"盈亏 $", th_pnl_pct:"盈亏 %", th_elapsed:"持仓时长",
+    th_qty:"数量", th_avg_usd:"均价 $", th_size:"数量", th_entry_price:"开仓价",
+    th_mark_price:"标记价", th_upl_usd:"浮盈 $", th_upl_pct:"浮盈 %", th_margin:"保证金",
+    th_id:"编号", th_mult:"倍数", th_win:"胜负", th_platform:"平台", th_why:"原因", th_time:"时间",
+    th_asset:"币种", th_total:"总额", th_available:"可用", th_locked:"冻结",
+    th_usdt_value:"USDT 估值", th_pair:"交易对", th_exec_price:"成交价",
+    th_amount:"数量", th_filled:"已成交", th_fee:"手续费",
+    th_no:"#", th_trader:"交易员", th_tier:"等级", th_total_pnl:"累计盈亏",
+    th_trades:"交易数", th_win_rate:"胜率",
+    th_username:"用户名", th_email:"邮箱", th_role:"角色", th_registered:"注册时间",
+    th_last_login:"最近登录", th_actions:"操作",
+    // ── page titles ──
+    pg_positions:"持仓", pg_positions_sub:"全平台现货与永续合约实时持仓",
+    pg_trades:"交易历史", pg_trades_sub:"数据库中的持久化交易记录",
+    pg_trades_sub_okx:"OKX 交易账户的已实现回合交易 \u2014 由 /trade/fills 配对生成",
+    tip_paper_replay:"模拟回放 — 未向 OKX 提交真实订单",
+    pg_spot:"OKX 现货", pg_spot_sub:"现货交易与余额管理",
+    pg_perp:"永续引擎", pg_perp_sub:"永续合约交易，内置自动风控",
+    pg_kelly:"Kelly 准则", pg_kelly_sub:"基于胜率与盈亏比的最优仓位计算",
+    pg_reports:"报告", pg_reports_sub:"绩效分析与交易统计",
+    pg_leaderboard:"盈利排行榜", pg_leaderboard_sub:"按累计盈亏排名的交易高手",
+    pg_members_sub:"请登录后继续",
+    // ── metric labels ──
+    ml_total_trades:"总交易数", ml_win_rate:"胜率", ml_total_pnl:"累计盈亏",
+    ml_avg_pnl:"单笔平均盈亏",
+    ml_spot_equity:"总权益 (USD)", ml_spot_avail:"可用 USDT", ml_spot_holdings:"持仓市值",
+    ml_perp_equity:"合约权益", ml_open_upl:"浮动盈亏", ml_autoclose_rules:"自动平仓规则",
+    ml_kelly_wr:"胜率", ml_kelly_payout:"平均盈亏比",
+    ml_kelly_full:"满 Kelly %", ml_kelly_half:"半 Kelly（推荐）",
+    ml_kelly_quarter:"四分之一 Kelly（保守）", ml_kelly_current:"当前单笔金额",
+    ml_kelly_util:"Kelly 使用率",
+    ml_kelly_wins:"盈利笔数", ml_kelly_losses:"亏损笔数", ml_kelly_pf:"盈亏因子",
+    ml_kelly_maxwin:"最大连胜", ml_kelly_maxloss:"最大连亏",
+    ml_rpt_avg:"单笔平均盈亏", ml_rpt_best:"最佳交易", ml_rpt_worst:"最差交易",
+    // ── perp rules ──
+    pr_tp:"止盈", pr_sl:"止损", pr_hold:"最长持仓时间", pr_status:"状态",
+    pr_tp_desc:"达到盈利自动平仓", pr_sl_desc:"达到亏损自动平仓",
+    pr_hold_desc:"超时强制平仓", pr_status_desc:"自动平仓已启用", pr_active:"运行中",
+    // ── buttons ──
+    btn_refresh:"刷新", btn_clear:"清空", btn_view_all:"查看全部 →",
+    btn_configure:"配置 →", btn_cancel:"取消", btn_save_settings:"保存设置",
+    btn_delete_member:"删除会员", btn_login:"登录", btn_register:"注册",
+    btn_sync_stats:"同步我的数据", btn_reset_lb:"重置排行榜",
+    btn_bulk_upgrade:"批量升级为高级会员", btn_send:"发送", btn_all:"全部",
+    btn_clear_sel:"清空", btn_logout:"退出登录",
+    // ── modals ──
+    am_edit_member:"编辑会员", am_role:"角色", am_tier:"等级", am_user:"普通用户", am_admin:"管理员",
+    am_free:"免费", am_premium:"高级", am_username:"用户名", am_password:"密码",
+    am_email:"邮箱（选填）", am_login_register:"登录 / 注册", am_log_in:"登录",
+    pm_title:"合约自动平仓设置",
+    pm_sub:"配置永续合约持仓的自动平仓规则",
+    pm_tp:"止盈阈值 (%)", pm_sl:"止损阈值 (%)",
+    pm_hold:"最长持仓时间（秒）", pm_maxsize:"单笔最大仓位 (USD)",
+    pm_reopen:"平仓后允许同一币种再次开仓",
+    mr_ticker:"币种：", mr_side:"方向：", mr_usd:"金额：",
+    // ── states / empty rows ──
+    loading:"加载中...", no_recent_trades:"暂无成交记录",
+    waiting_signals:"— 等待信号中 —", no_open_positions:"— 暂无持仓 —",
+    no_history_yet:"— 暂无历史记录 —", no_ai_decisions:"— 暂无 AI 决策 —",
+    no_pending_swaps:"— 暂无待处理交易包 —", no_perp_positions:"— 暂无永续持仓 —",
+    no_spot_positions:"— 暂无现货持仓 —", no_perp_positions_short:"— 暂无合约持仓 —",
+    login_to_sync:"请登录后同步数据，即可出现在排行榜中",
+    login_to_members:"请登录后进入会员中心",
+    loading_lb:"排行榜加载中...", all_platforms:"全部平台",
+    trades_count:"笔交易", search_ticker:"搜索币种...", search:"搜索...",
+    click_select_coins:"点击选择币种...", leave_empty:"（留空表示不筛选）",
+    // ── trade settings ──
     deskStatus:"交易台状态", state:"状态", theme:"主题",
     enteredRejected:"入场 / 拒绝", expectancy:"期望值",
     kelly:"Kelly 满 / 实", currentOpen:"当前持仓详情",
     feed:"信号流", idle:"待机", running:"运行中", done:"完成",
     noData:"无数据", noOpen:"— 暂无持仓 —", noHistory:"— 暂无历史交易 —",
+    min_trade_usd:"单笔最小金额 (USD)", max_position_usd:"单笔最大金额 (USD)",
+    bandHint:"单笔金额区间只作用于「开仓」下单金额；一键平仓与止盈/止损平仓不受区间限制，确保任何仓位都能退出。",
+    closePos:"平仓", closeAll:"全部平仓", perTradeLimit:"单笔限额",
     submit:"提交", submitted:"已提交", failed:"失败", pending:"待签名",
     connectWallet:"连接钱包", disconnect:"断开", connected:"已连接",
     manualSignal:"手动信号测试",
@@ -1351,6 +1584,23 @@ const I18N = {
     strat_t1:"所有交易通过你自己的 OKX API 执行，资金始终在你账户。",
     strat_t2:"历史交易与 Equity 曲线实时公开可查。",
     strat_t3:"不承诺收益，过往表现不代表未来结果。交易有风险。",
+    // ── member centre / trade settings ──
+    trade_settings:"交易设置", api_key_management:"API Key 管理",
+    risk_preference:"风险偏好", trade_mode:"交易模式",
+    signal_only:"仅信号", signal_only_desc:"AI 只给建议，需手动确认",
+    auto_exec:"全自动", auto_exec_desc:"AI 直接下单执行",
+    take_profit:"止盈 (%)", stop_loss:"止损 (%)",
+    allowed_tickers:"筛选币种", runtime:"运行时间", unlimited:"无限（24 小时）",
+    save:"保存", configured:"已配置", not_configured:"未配置",
+    api_key:"API Key", api_secret:"API 密钥", api_passphrase:"API 密码短语",
+    th_exit_usd:"出场 $", th_type:"类型", th_pnl_short:"盈亏",
+    // ── side / result badges ──
+    side_entry:"入场", side_exit:"出场", side_stop:"止损", side_halt:"已暂停",
+    side_reject:"已拦截", side_skip:"跳过",
+    side_long:"多", side_short:"空", side_buy:"买入", side_sell:"卖出",
+    badge_win:"盈", badge_loss:"亏",
+    pt_okx_trade_history:"OKX 成交历史", auto_badge:"自动",
+    mr_entry:"开仓（买入）", mr_exit:"平仓（卖出）",
     // Navigation
     nav_overview:"概览", nav_dashboard:"仪表盘", nav_positions:"持仓", nav_trades:"交易",
     nav_engine:"引擎", nav_spot:"OKX 现货", nav_perp:"永续引擎",
@@ -1359,18 +1609,89 @@ const I18N = {
   }
 };
 let lang = "en";
-function setLang(l){lang=l;applyLang();}
+const _i18nMissing = new Set();
+
+/** Look up a translation. Falls back to English, then the raw key, and
+ *  records the miss so gaps surface in the console instead of silently
+ *  rendering the hard-coded English source text. */
+function t(k){
+  const hit = (I18N[lang] || {})[k];
+  if (hit !== undefined) return hit;
+  if (!_i18nMissing.has(k)) {
+    _i18nMissing.add(k);
+    console.warn("[i18n] missing key '" + k + "' for lang=" + lang + " — fell back to English");
+  }
+  return (I18N.en || {})[k] !== undefined ? I18N.en[k] : k;
+}
+
+/** Side / direction values arrive from the API as bare English codes
+ *  (ENTRY, EXIT, LONG, SHORT, BUY, SELL…). Map them through the dictionary
+ *  so the badges read correctly in both languages. */
+const _SIDE_KEY = {
+  ENTRY:'side_entry', EXIT:'side_exit', STOP:'side_stop', HALT:'side_halt',
+  REJECT:'side_reject', NOT_BUY:'side_skip',
+  LONG:'side_long', SHORT:'side_short', BUY:'side_buy', SELL:'side_sell',
+};
+function tSide(v){ return (v && _SIDE_KEY[v]) ? t(_SIDE_KEY[v]) : (v || '—'); }
+function tWin(v){ return t(v ? 'badge_win' : 'badge_loss'); }
+
+function setLang(l){
+  lang = l;
+  try { localStorage.setItem("rh_lang", l); } catch (e) {}
+  applyLang();
+  if (typeof rerenderI18n === "function") { try { rerenderI18n(); } catch (e) {} }
+}
+
 function applyLang(){
   document.querySelectorAll("[data-i18n]").forEach(el=>{
-    const k=el.getAttribute("data-i18n");
-    if(!I18N[lang][k])return;
-    const childEls=el.children.length;
-    if(childEls===0){el.textContent=I18N[lang][k];}
-    else{const tn=Array.from(el.childNodes).find(n=>n.nodeType===Node.TEXT_NODE&&n.textContent.trim());if(tn)tn.textContent=I18N[lang][k]+" ";}
+    const k = el.getAttribute("data-i18n");
+    const raw = (I18N[lang] || {})[k];
+    if (raw === undefined) {
+      if (!_i18nMissing.has(k)) {
+        _i18nMissing.add(k);
+        console.warn("[i18n] missing key '" + k + "' for lang=" + lang + " — element left untranslated");
+      }
+      return;
+    }
+    if (el.children.length === 0) {
+      // Plain leaf element — safe to swap the whole text.
+      el.textContent = raw;
+    } else if (raw.indexOf("<") !== -1) {
+      // Dictionary value carries markup (e.g. <br>) and so does the element —
+      // replace the whole subtree so the markup renders instead of showing literally.
+      el.innerHTML = raw;
+    } else {
+      // Mixed content (dot span, badge, …) — patch only the first real text node
+      // so the nested elements survive.
+      const tn = Array.from(el.childNodes)
+        .find(n => n.nodeType === Node.TEXT_NODE && n.textContent.trim());
+      if (tn) tn.textContent = " " + raw + " ";
+    }
   });
-  document.getElementById("btnLangEN").classList.toggle("active",lang==="en");
-  document.getElementById("btnLangZH").classList.toggle("active",lang==="zh");
+  // Placeholders (search boxes) carry their key in data-i18n-ph.
+  document.querySelectorAll("[data-i18n-ph]").forEach(el=>{
+    const k = el.getAttribute("data-i18n-ph");
+    const raw = (I18N[lang] || {})[k];
+    if (raw === undefined) {
+      if (!_i18nMissing.has(k)) {
+        _i18nMissing.add(k);
+        console.warn("[i18n] missing placeholder key '" + k + "' for lang=" + lang);
+      }
+      return;
+    }
+    el.setAttribute("placeholder", raw);
+  });
+  document.documentElement.lang = (lang === "zh" ? "zh-CN" : "en");
+  const en = document.getElementById("btnLangEN");
+  const zh = document.getElementById("btnLangZH");
+  if (en) en.classList.toggle("active", lang === "en");
+  if (zh) zh.classList.toggle("active", lang === "zh");
 }
+// Restore the operator's last language choice on boot.
+try {
+  const _saved = localStorage.getItem("rh_lang");
+  if (_saved === "zh" || _saved === "en") lang = _saved;
+} catch (e) {}
 
 const $ = id => document.getElementById(id);
 const eqCanvas=$("equity"), eqCtx=eqCanvas.getContext("2d");
@@ -1415,40 +1736,101 @@ function drawEquity(){
   const vRange=vMax-vMin;
   const vMid=(vMax+vMin)/2;
 
-  let vmin, vmax, useLog=true;
-  if(vRange < vMid*0.01){
-    useLog=false;
-    const pad=vRange*0.5||vMid*0.02;
-    vmin=Math.max(0, vMin-pad);
-    vmax=vMax+pad;
-  }else{
-    const start=vMid;
-    vmin=Math.max(10,Math.min(start*0.5,vMin*0.8));
-    vmax=Math.max(start*2,Math.max(...visV)*1.2);
+  // 选 1/2/5/10 倍数的"漂亮"刻度: nice = round(range/target, 10^-log10(range/target))
+  function niceStep(range, target){
+    if(range<=0) return Math.max(1, target);
+    const raw = range / target;
+    const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const norm = raw / mag;
+    let nice;
+    if(norm < 1.5) nice = 1;
+    else if(norm < 3) nice = 2;
+    else if(norm < 7) nice = 5;
+    else nice = 10;
+    return nice * mag;
   }
 
-  const padL=60,padR=24,padT=14,padB=30;
+  // ── Axis range: always linear, with "nice" min/max ──
+  // OKX account equity 波动通常 < 1% — 强制线性避免 log 抖动
+  let vmin, vmax;
+  const span = (vMax - vMin) || Math.max(1, vMid * 0.001);
+  const yTargetSteps = 5;
+  const yStep = niceStep(span, yTargetSteps);
+  vmin = Math.max(0, Math.floor(vMin / yStep) * yStep - yStep * 0.2);
+  vmax = Math.ceil(vMax / yStep) * yStep + yStep * 0.2;
+
+  const padL=64,padR=24,padT=14,padB=34;
   const pw=W-padL-padR, ph=H-padT-padB;
-  const logVmin=Math.log10(Math.max(0.01,vmin)), logVmax=Math.log10(vmax);
 
   const tMin=visT[0], tMax=visT[visT.length-1];
   const sx=t=>padL+pw*((t-tMin)/(tMax-tMin||1));
-  const sy=v=>padT+ph*(1-(useLog?(Math.log10(Math.max(vmin,v))-logVmin)/(logVmax-logVmin):((v-vmin)/(vmax-vmin))));
+  const sy=v=>padT+ph*(1-((v-vmin)/(vmax-vmin||1)));
 
-  eqCtx.strokeStyle="#232830"; eqCtx.lineWidth=0.5;
-  eqCtx.font="10px JetBrains Mono,monospace"; eqCtx.fillStyle="#6b7280";
-  const yStep=useLog?Math.pow(10,Math.ceil(logVmin)):(vmax-vMin)/5;
-  for(let v=useLog?Math.pow(10,Math.ceil(logVmin)):vmin;v<=vmax;v+=yStep){
-    const y=sy(v);
-    if(y>=padT && y<=padT+ph){
-      eqCtx.beginPath();
-      eqCtx.moveTo(padL,y);
-      eqCtx.lineTo(W-padR,y);
-      eqCtx.stroke();
-      eqCtx.fillText("$"+v.toLocaleString(undefined,{maximumFractionDigits:0}),6,y+3);
-    }
+  // ── Y-axis: gridlines + value labels (left) ──
+  eqCtx.font="10px 'JetBrains Mono',monospace";
+  eqCtx.textBaseline="middle";
+  const yTicks = [];
+  for(let v=vmin; v<=vmax + yStep*0.01; v+=yStep){
+    yTicks.push(v);
   }
+  yTicks.forEach(v=>{
+    const y=sy(v);
+    if(y < padT-1 || y > padT+ph+1) return;
+    eqCtx.strokeStyle="#1c2028"; eqCtx.lineWidth=0.5;
+    eqCtx.beginPath(); eqCtx.moveTo(padL,y); eqCtx.lineTo(W-padR,y); eqCtx.stroke();
+    eqCtx.fillStyle="#8a919e";
+    const lbl = "$"+v.toLocaleString(undefined,{maximumFractionDigits: v<10 ? 2 : 0});
+    eqCtx.fillText(lbl, 6, y);
+  });
+  // left axis line
+  eqCtx.strokeStyle="#3a4150"; eqCtx.lineWidth=0.8;
+  eqCtx.beginPath(); eqCtx.moveTo(padL, padT); eqCtx.lineTo(padL, padT+ph); eqCtx.stroke();
 
+  // ── X-axis: time labels (HH:MM format, 4 labels evenly spaced) ──
+  eqCtx.fillStyle="#8a919e";
+  eqCtx.textBaseline="top";
+  const xTickCount = 4;
+  const tSpan = tMax - tMin;
+  const tStep = tSpan / xTickCount;
+  for(let i=0; i<=xTickCount; i++){
+    const t = tMin + i * tStep;
+    const x = sx(t);
+    if(x < padL-1 || x > W-padR+1) continue;
+    // vertical tick line
+    eqCtx.strokeStyle="#1c2028"; eqCtx.lineWidth=0.5;
+    eqCtx.beginPath(); eqCtx.moveTo(x, padT+ph); eqCtx.lineTo(x, padT+ph+4); eqCtx.stroke();
+    // time label
+    const d = new Date(t*1000);
+    const hh = String(d.getHours()).padStart(2,'0');
+    const mm = String(d.getMinutes()).padStart(2,'0');
+    const ss = tSpan < 3600 ? String(d.getSeconds()).padStart(2,'0') : '';
+    const lbl = hh + ':' + mm + (ss ? ':' + ss : '');
+    eqCtx.fillStyle="#8a919e";
+    eqCtx.fillText(lbl, x - eqCtx.measureText(lbl).width/2, padT+ph+8);
+  }
+  // bottom axis line
+  eqCtx.strokeStyle="#3a4150"; eqCtx.lineWidth=0.8;
+  eqCtx.beginPath(); eqCtx.moveTo(padL, padT+ph); eqCtx.lineTo(W-padR, padT+ph); eqCtx.stroke();
+
+  // ── Hover crosshair + value tooltip will be drawn on demand; keep simple here ──
+  // Show first / last / min / max data points as small markers
+  const markerData = [
+    {v: vMin, label: 'min'},
+    {v: vMax, label: 'max'},
+    {v: visV[0], label: 'first'},
+    {v: visV[visV.length-1], label: 'now'}
+  ];
+  eqCtx.font="9px 'JetBrains Mono',monospace";
+  eqCtx.fillStyle="#5a606a";
+  eqCtx.textBaseline="bottom";
+  markerData.forEach(m=>{
+    const y=sy(m.v);
+    if(y<padT||y>padT+ph) return;
+    eqCtx.fillText(m.label, W-padR+2, y);
+    eqCtx.fillStyle="#232830";
+    eqCtx.fillRect(padL, y-0.5, pw, 1);
+    eqCtx.fillStyle="#5a606a";
+  });
   const lastVis=visT.length-1;
 
   // Gradient fill under the line
@@ -1486,13 +1868,17 @@ function drawEquity(){
 }
 
 // === Monitor ===
-function updateMonitor(m, okxBalance){
+function updateMonitor(m, okxBalance, isOkxMode){
   if(!m)return;
   $("mon-mult").textContent=(m.multiple||1).toFixed(2)+"x";
   // OKX mode: use real balance instead of simulator bankroll
   if(okxBalance){
     const mb=$("mon-bank");
     if(mb) mb.textContent="$"+okxBalance.total_eq_usd.toFixed(2);
+  } else if(isOkxMode){
+    // OKX sim account not fetched yet — do NOT fall back to simulator 500
+    const mb=$("mon-bank");
+    if(mb){mb.textContent="— OKX not fetched —";}
   } else {
     const mb=$("mon-bank");
     if(mb) mb.textContent="$"+(m.bankroll||0).toFixed(0);
@@ -1517,11 +1903,143 @@ function renderFeed(feed){
   $("feed-log").innerHTML=lines.join("\n")||(lang==="zh"?"— 等待信号 —":"— waiting for signals —");
 }
 
+// === One-Click Close Position ===================================
+// Executes against the logged-in member's OWN OKX credentials. The button is
+// guarded so a double click can never fire two market orders.
+const _closingKeys = new Set();
+let _closeRefreshTimer = null;
+
+function _jsq(s){
+  return String(s==null?'':s).replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;');
+}
+function closeBtn(kind, instId, ticker, side, sizeUsd){
+  const key = kind+'|'+instId;
+  const busy = _closingKeys.has(key);
+  const label = busy ? '…' : (lang==="zh"?"平仓":"CLOSE");
+  return `<button class="btn-close-pos${busy?' busy':''}" ${busy?'disabled':''} title="${lang==="zh"?"市价平掉该仓位":"Market-close this position"}" onclick="closePosition('${_jsq(kind)}','${_jsq(instId)}','${_jsq(ticker)}','${_jsq(side)}',${Number(sizeUsd)||0},this)">${label}</button>`;
+}
+
+async function closePosition(kind, instId, ticker, side, sizeUsd, btn){
+  const key = kind+'|'+instId;
+  if(_closingKeys.has(key)) return;
+  if(!_currentUser){ showToast(lang==="zh"?"请先登录账号":"Please log in first", true); return; }
+  const amt = Number(sizeUsd)||0;
+  const isSpot = kind === 'spot';
+  const msg = lang==="zh"
+    ? `确认以市价平掉 ${ticker}（${isSpot?"现货":"合约"}）仓位${amt?`，约 $${amt.toFixed(2)}`:""}？\n\n该指令会立即在你自己绑定的 OKX 账户执行，成交后不可撤销。`
+    : `Market-close the ${ticker} ${isSpot?"spot":"perp"} position${amt?` (~$${amt.toFixed(2)})`:""}?\n\nThis is sent immediately to YOUR OKX account and cannot be undone.`;
+  if(!confirm(msg)) return;
+
+  _closingKeys.add(key);
+  if(btn){ btn.disabled = true; btn.classList.add('busy'); btn.textContent = '…'; }
+  try{
+    const r = await fetch('/api/position/close', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      credentials:'same-origin',
+      body: JSON.stringify({kind, inst_id: instId, ticker, side, size_usd: amt})
+    }).then(x=>x.json()).catch(()=>({ok:false,msg:'network error'}));
+    if(r && r.ok){
+      showToast((lang==="zh"?"✅ 已平仓 ":"✅ Closed ")+(r.msg||ticker));
+    } else {
+      showToast(((r&&r.msg)||(r&&r.error)||"Close failed"), true);
+    }
+  }catch(e){
+    showToast('Error: '+e.message, true);
+  }finally{
+    _closingKeys.delete(key);
+    if(btn){ btn.classList.remove('busy'); }
+    // OKX settles positions asynchronously — re-pull a couple of times.
+    clearTimeout(_closeRefreshTimer);
+    setTimeout(refreshDeskStateNow, 600);
+    _closeRefreshTimer = setTimeout(refreshDeskStateNow, 2500);
+  }
+}
+
+async function refreshDeskStateNow(){
+  try{
+    const r = await fetch('/api/desk-state',{cache:'no-store',credentials:'same-origin'});
+    if(r.ok) applyDeskState(await r.json());
+  }catch(e){}
+}
+
 // === Positions ===
+let _posTheadMode = 'system';
+function setPosThead(mode){
+  if(mode) _posTheadMode = mode;
+  const thead = $("pos-thead");
+  if(!thead) return;
+  const keys = (_posTheadMode === 'member')
+    ? ['th_ticker','th_type','th_side','th_entry','th_notional','th_pnl_short','th_action']
+    : ['th_ticker','th_side','th_entry','th_buy_usd','th_peak','th_current','th_size_pct'];
+  thead.innerHTML = keys.map(k => '<th data-i18n="' + k + '">' + t(k) + '</th>').join('');
+}
+
+/** Re-render every language-dependent dynamic surface in place.
+ *  Called by setLang() so a switch takes effect immediately instead of
+ *  waiting for the next 1 Hz poll. */
+function rerenderI18n(){
+  try {
+    // The render throttles compare payload signatures, not rendered output —
+    // drop them so the same payload renders again in the new language.
+    Object.keys(_sigCache).forEach(k => delete _sigCache[k]);
+    setPosThead(_posTheadMode);
+    if (window.__lastDeskState) applyDeskState(window.__lastDeskState);
+    // Refresh EVERY page's dynamic content, not only the visible one:
+    // hidden sections keep their previously-rendered (old-language) DOM
+    // until something re-renders them, and their tables are rebuilt from
+    // cached payloads whose signature has not changed.
+    const loaders = ['refreshPositionsPage', 'loadTradesPage', 'loadSpotPage',
+                     'loadPerpPage', 'loadReportsPage', 'loadLeaderboardPage',
+                     'loadMembersPage'];
+    for (const fn of loaders) {
+      if (typeof window[fn] !== 'function') continue;
+      try {
+        const r = window[fn]();
+        if (r && typeof r.catch === 'function') r.catch(()=>{});
+      } catch (e) {}
+    }
+  } catch (e) {
+    console.warn('[i18n] re-render failed:', e);
+  }
+}
+
+// Positions belonging to the logged-in member's own OKX account
+function renderMemberPositions(list){
+  const tbody=$("pos-body");
+  if(!tbody) return;
+  setPosThead('member');
+  if(!list||!list.length){
+    tbody.innerHTML=`<tr><td colspan="7" class="empty-row">— ${lang==="zh"?"暂无持仓":"no open positions"} —</td></tr>`;
+    return;
+  }
+  tbody.innerHTML=list.map(p=>{
+    const pnl=Number(p.upl)||0;
+    const pct=Number(p.pnl_pct)||0;
+    const pnlCls=pnl>=0?'pnl-pos':'pnl-neg';
+    const sign=pnl>=0?'+':'';
+    const isSpot=p.kind==='spot';
+    const typeLabel=isSpot?(lang==="zh"?"现货":"SPOT"):(lang==="zh"?"合约":"PERP");
+    const sideLabel=isSpot?(lang==="zh"?"持有":"HOLD"):(p.side||'—');
+    const sideCls=p.side==='LONG'?'side-buy':'side-sell';
+    const entry=(p.entry_px!==null&&p.entry_px!==undefined)?'$'+Number(p.entry_px).toFixed(6):'—';
+    return `<tr>
+      <td style="font-weight:600">${p.ticker||'—'}</td>
+      <td style="color:var(--text-dim)">${typeLabel}${p.leverage?` · ${p.leverage}x`:''}</td>
+      <td class="${sideCls}">${sideLabel}</td>
+      <td>${entry}</td>
+      <td>$${(Number(p.size_usd)||0).toFixed(2)}</td>
+      <td class="${pnlCls}">${sign}$${Math.abs(pnl).toFixed(2)} <span style="opacity:.72">(${sign}${pct.toFixed(2)}%)</span></td>
+      <td>${closeBtn(p.kind,p.inst_id,p.ticker,p.side,p.size_usd)}</td>
+    </tr>`;
+  }).join("");
+}
+
 function renderPositions(positions){
   const tbody=$("pos-body");
+  setPosThead('system');
   if(!positions||!positions.length){
-    tbody.innerHTML=`<tr><td colspan="8" class="empty-row">— ${lang==="zh"?"暂无持仓":"no open positions"} —</td></tr>`;return;
+    tbody.innerHTML=`<tr><td colspan="7" class="empty-row">— ${lang==="zh"?"暂无持仓":"no open positions"} —</td></tr>`;return;
   }
   tbody.innerHTML=positions.map(p=>{
     const nowColor=(p.current_mult||1)>=1?'var(--green)':'var(--red)';
@@ -1556,17 +2074,21 @@ function renderPerpPositions(perpPositions, perpStats, perpConfig){
     const sideColor=p.side==="LONG"?"var(--green)":"var(--red)";
     const pnlCls=p.upl>=0?"pnl-pos":"pnl-neg";
     const sign=p.upl>=0?"+":"";
-    const pnlPct = p.avg_px ? ((p.upl / (Math.abs(p.size)*p.avg_px))*100).toFixed(2) : "0.00";
+    // Prefer backend-computed pnl_pct (upl/margin); fallback to old formula
+    const pnlPct = (p.pnl_pct !== undefined && p.pnl_pct !== null)
+      ? p.pnl_pct.toFixed(2)
+      : (p.avg_px ? ((p.upl / (Math.abs(p.size)*p.avg_px))*100).toFixed(2) : "0.00");
     return `<tr>
       <td style="font-weight:600">${p.ticker}</td>
-      <td style="color:${sideColor};font-weight:600">${p.side}</td>
+      <td style="color:${sideColor};font-weight:600">${tSide(p.side)}</td>
       <td>$${p.avg_px?.toFixed(4)||"—"}</td>
       <td>$${p.last_px?.toFixed(4)||"—"}</td>
       <td>$${(p.size_usd||0).toFixed(2)}</td>
       <td>${p.lever||5}x</td>
       <td class="${pnlCls}">${sign}$${(p.upl||0).toFixed(2)}</td>
-      <td class="${pnlCls}">${sign}${pnlPct}%</td>
+      <td class="${pnlCls}">${p.upl>=0?'+':''}${pnlPct}%</td>
       <td style="color:var(--text-dim)">${Math.abs(p.size).toFixed(2)}</td>
+      <td>${closeBtn('perp', p.inst_id||((p.ticker||'')+'-USDT-SWAP'), p.ticker, p.side, p.size_usd)}</td>
     </tr>`;
   }).join("");
   if(pager){
@@ -1618,7 +2140,7 @@ function renderOkxTrades(fills){
     const sideCls=(t.side||"").toUpperCase()==="BUY"?"side-buy":"side-sell";
     const feeSign=t.fee<0?"":"-";
     html+=`<tr>
-      <td class="${sideCls}">${t.side||"—"}</td>
+      <td class="${sideCls}">${tSide(t.side)}</td>
       <td style="font-weight:600">${t.ticker||"?"}</td>
       <td>$${(t.notional_usd||0).toFixed(2)}</td>
       <td style="color:var(--text-dim)">${feeSign}$${Math.abs(t.fee||0).toFixed(4)}</td>
@@ -1658,8 +2180,8 @@ function renderSwaps(swapsData, isOkx){
     const h2=card.querySelector(".panel-title");
     if(h2){
       h2.innerHTML = _isOkxMode
-        ? '<span class="dot"></span><span data-i18n="swapsTitle">📊 OKX TRADE HISTORY</span> <span id="swap-badge" class="badge green">(auto)</span>'
-        : `<span class="dot amber"></span><span data-i18n="swapsTitle">🔗 SWAP BUNDLES</span> <span id="swap-badge" class="badge">(${pending.length})</span>`;
+        ? `<span class="dot"></span><span>📊 ${t('pt_okx_trade_history')}</span> <span id="swap-badge" class="badge green">(${t('auto_badge')})</span>`
+        : `<span class="dot amber"></span><span>🔗 ${t('swapsTitle')}</span> <span id="swap-badge" class="badge">(${pending.length})</span>`;
     }
     const pHead=card.querySelector(".panel-title");
     if(pHead){
@@ -1674,7 +2196,7 @@ function renderSwaps(swapsData, isOkx){
     pending.forEach(s=>{
       const sideCls=s.side==="BUY"?"side-buy":"side-sell";
       html+=`<tr data-key="${s.key}">
-        <td class="${sideCls}">${s.side}</td>
+        <td class="${sideCls}">${tSide(s.side)}</td>
         <td style="font-weight:600">${s.ticker}</td>
         <td>$${s.amount_usd.toFixed(2)}</td>
         <td><span class="tag ${s.platform==='okx'?'tag-okx':'tag-jup'}">${s.platform==='okx'?'OKX':'JUP'}</span></td>
@@ -1686,14 +2208,14 @@ function renderSwaps(swapsData, isOkx){
     if(submitted.length){
       html+=`<tr><td colspan="7" style="color:var(--text-dim);font-size:10px;padding:4px 12px;text-transform:uppercase;letter-spacing:.1em;font-family:var(--mono)">— ${lang==="zh"?"最近提交":"Recent Submitted"} (${submitted.length}) —</td></tr>`;
       submitted.slice(-5).forEach(s=>{
-        html+=`<tr><td class="side-buy">${s.side}</td><td style="font-weight:600">${s.ticker||"?"}</td>
+        html+=`<tr><td class="side-buy">${tSide(s.side)}</td><td style="font-weight:600">${s.ticker||"?"}</td>
           <td>$${s.amount_usd?.toFixed(2)||"—"}</td><td><span class="tag tag-okx">OKX</span></td><td colspan="3" style="color:var(--text-dim);font-size:9px;font-family:var(--mono)">${s.order_id?s.order_id.substring(0,16):"—"}</td></tr>`;
       });
     }
     if(failed.length){
       html+=`<tr><td colspan="7" style="color:var(--text-dim);font-size:10px;padding:4px 12px;text-transform:uppercase;letter-spacing:.1em;font-family:var(--mono)">— ${lang==="zh"?"最近失败":"Recent Failed"} (${failed.length}) —</td></tr>`;
       failed.slice(-3).forEach(s=>{
-        html+=`<tr><td class="side-sell">${s.side||"FAIL"}</td><td>${s.ticker||"?"}</td>
+        html+=`<tr><td class="side-sell">${tSide(s.side)||"FAIL"}</td><td>${s.ticker||"?"}</td>
           <td colspan="5" style="color:var(--red);font-size:10px">${String(s.error||"").substring(0,60)}</td></tr>`;
       });
     }
@@ -1711,7 +2233,7 @@ function renderSwaps(swapsData, isOkx){
           const sideCls = (t.side||"").toUpperCase()==="BUY"?"side-buy":"side-sell";
           const feeSign = t.fee < 0 ? "" : "-";
           html+=`<tr>
-            <td class="${sideCls}">${t.side||"—"}</td>
+            <td class="${sideCls}">${tSide(t.side)}</td>
             <td style="font-weight:600">${t.ticker||"?"}</td>
             <td>$${(t.notional_usd||0).toFixed(2)}</td>
             <td style="color:var(--text-dim)">${feeSign}$${Math.abs(t.fee||0).toFixed(4)}</td>
@@ -1848,9 +2370,13 @@ async function sendManualSignal(){
   const side=$("manualSide").value;
   const usd=parseFloat($("manualUsd").value)||50;
   try{
-    const resp=await fetch("/api/manual/signal",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ticker,side,usd})});
+    const resp=await fetch("/api/manual/signal",{method:"POST",headers:{"Content-Type":"application/json"},credentials:"same-origin",body:JSON.stringify({ticker,side,usd})});
     const data=await resp.json();
-    if(data.ok)showToast(`✅ ${side} ${ticker} $${usd} queued`);
+    if(data.ok){
+      const finalUsd = (data.usd!==undefined) ? data.usd : usd;
+      showToast(`✅ ${side} ${ticker} $${finalUsd} queued`
+        + (data.clamped ? ` · ${data.clamped}` : ''));
+    }
     else showToast(`❌ ${data.error}`,true);
   }catch(e){showToast(`❌ ${e.message}`,true);}
 }
@@ -1882,11 +2408,81 @@ async function refreshStatus(){
 }
 
 // === SSE connection ===
+// Cheap change detection so a 1 Hz poll does not rebuild identical DOM.
+const _sigCache = {};
+function _changed(key, value){
+  const v = (typeof value === 'string') ? value : JSON.stringify(value);
+  if(_sigCache[key] === v) return false;
+  _sigCache[key] = v;
+  return true;
+}
+
+// Which account is the dashboard currently showing?
+function updateAccountBanner(s){
+  const el = document.getElementById('acct-banner');
+  const txt = document.getElementById('acct-banner-text');
+  const bandEl = document.getElementById('acct-banner-band');
+  const owner = document.getElementById('pos-owner-badge');
+  const band = s.trade_band;
+  if(bandEl){
+    const parts = [];
+    if(band && band.max > 0){
+      parts.push(lang==="zh" ? `单笔限额 $${band.min}–$${band.max}` : `Per-trade $${band.min}–$${band.max}`);
+    }
+    if(s.personalized && s.account_baseline_eq){
+      parts.push(lang==="zh"
+        ? `今日基准 $${s.account_baseline_eq}${s.account_baseline_day?' · '+s.account_baseline_day:''}`
+        : `Day base $${s.account_baseline_eq}${s.account_baseline_day?' · '+s.account_baseline_day:''}`);
+    }
+    bandEl.textContent = parts.join('  |  ');
+  }
+  if(owner){
+    if(s.personalized && s.account_owner){
+      owner.style.display=''; owner.textContent = '@'+s.account_owner;
+    } else {
+      owner.style.display='none';
+    }
+  }
+  if(!el) return;
+  el.style.display='flex';
+  if(s.personalized){
+    el.className = 'acct-banner' + (s.account_pending ? ' warn' : (s.account_error ? ' err' : ''));
+    if(txt){
+      if(s.account_pending){
+        txt.textContent = lang==="zh"
+          ? `正在同步 ${s.account_owner||''} 的 OKX 账户数据，请稍候…`
+          : `Syncing ${s.account_owner||''}'s OKX account, one moment…`;
+      } else if(s.account_error){
+        txt.textContent = (lang==="zh"?"账户数据异常：":"Account error: ") + s.account_error;
+      } else {
+        txt.textContent = lang==="zh"
+          ? `当前显示 @${s.account_owner||''} 的专属账户数据（已绑定自有 OKX API Key）`
+          : `Showing @${s.account_owner||''}'s own account (personal OKX API key bound)`;
+      }
+    }
+  } else {
+    el.className = 'acct-banner muted';
+    if(txt){
+      txt.textContent = _currentUser
+        ? (lang==="zh"
+            ? '当前为系统默认数据 — 在「会员中心 → Trade Settings / API Keys」填写你自己的 OKX API Key 后，仪表盘即切换为你的专属账户数据'
+            : 'System default data — fill in your own OKX API key under Member Center → Trade Settings / API Keys to switch this dashboard to your account')
+        : (lang==="zh"
+            ? '当前为系统默认数据 — 登录并绑定 OKX API Key 后，即显示你的专属账户交易数据'
+            : 'System default data — log in and bind your OKX API key to see your own account data');
+    }
+  }
+}
+
 function applyDeskState(s){
   if(!s)return;
   window.__lastDeskState = s;
+  const personalized = !!s.personalized;
+  updateAccountBanner(s);
+
   // ── OKX REAL ACCOUNT DATA: use real balance and skip simulator positions ──
   const okxBalance = s.okx_connected && s.okx_real_balance ? s.okx_real_balance : null;
+  const isOkxMode = !!(s.okx_connected || s.is_okx);
   if(okxBalance){
     const pnlSub = document.getElementById('mon-pnl-sub');
     if(pnlSub) {
@@ -1895,55 +2491,86 @@ function applyDeskState(s){
       pnlSub.textContent = (realPnl >= 0 ? '+' : '') + '$' + Math.abs(realPnl).toFixed(2);
       pnlSub.style.color = realPnl >= 0 ? 'var(--green)' : 'var(--red)';
     }
+  } else if(isOkxMode){
+    // OKX mode, account not fetched — PnL sub must not show simulator value
+    const pnlSub = document.getElementById('mon-pnl-sub');
+    if(pnlSub){ pnlSub.textContent = 'awaiting OKX'; pnlSub.style.color = 'var(--text-dim)'; }
   }
-  if(s.equity&&Array.isArray(s.equity)&&s.equity.length>0){
-    // OKX mode: build equity curve from OKX real balance (cached, not per-tick)
-    if(okxBalance && okxBalance.total_eq_usd > 0){
-      const nowSec = Math.floor(Date.now()/1000);
-      const bal = okxBalance.total_eq_usd;
-      // Add point every 30s to match OKX cache refresh rate
-      if(nowSec - _eqOkxLastSec >= 30 || _eqOkxAccum.length === 0){
-        _eqOkxAccum.push({t: nowSec, v: bal});
-        _eqOkxLastSec = nowSec;
-      }
-      eqW = _eqOkxAccum.map(p=>p.t);
-      eqV = _eqOkxAccum.map(p=>p.v);
-    } else if (!okxBalance) {
-      // No OKX balance available — fall back to simulator equity curve
-      eqW = s.equity.map(p=>p[0]);
-      eqV = s.equity.map(p=>p[1]);
+  // ── Equity curve ──
+  // A live OKX balance always wins: it belongs to whichever account this
+  // payload describes (member's own, or the shared desk).
+  if(okxBalance && okxBalance.total_eq_usd > 0){
+    const nowSec = Math.floor(Date.now()/1000);
+    const bal = okxBalance.total_eq_usd;
+    // One point every 30s to match the server-side snapshot interval.
+    if(nowSec - _eqOkxLastSec >= 30 || _eqOkxAccum.length === 0){
+      _eqOkxAccum.push({t: nowSec, v: bal});
+      _eqOkxLastSec = nowSec;
     }
-  } else if(s.equity && Array.isArray(s.equity) && s.equity.length > 0) {
-    // Fallback: use raw equity data directly
+    eqW = _eqOkxAccum.map(p=>p.t);
+    eqV = _eqOkxAccum.map(p=>p.v);
+  } else if(isOkxMode){
+    // OKX mode but the account has not been fetched yet — clear the curve
+    // rather than drawing simulator equity, which would be DEMO data.
+    eqW = [];
+    eqV = [];
+  } else if(s.equity && Array.isArray(s.equity) && s.equity.length > 0){
     eqW = s.equity.map(p=>p[0]);
     eqV = s.equity.map(p=>p[1]);
   }
-  try { if(s.monitor&&s.monitor.multiple!==undefined){updateMonitor(s.monitor, okxBalance);} } catch(e){ /* legacy IDs may be missing */ }
-  // OKX mode: render perp positions, skip simulator positions
-  if(s.perp_positions && s.perp_positions.length > 0){
-    renderPerpPositions(s.perp_positions, s.perp_stats, s.perp_config);
-    // Hide simulator Open Positions card (shows nothing but takes up space)
-    const posCard = document.getElementById('positions-card');
-    if(posCard) posCard.style.display = 'none';
-  } else {
-    // Non-OKX mode: use simulator positions
-    if(s.positions)renderPositions(s.positions);
-    const posCard = document.getElementById('positions-card');
+  try { if(s.monitor&&s.monitor.multiple!==undefined){updateMonitor(s.monitor, okxBalance, isOkxMode);} } catch(e){ /* legacy IDs may be missing */ }
+
+  const posCard = document.getElementById('positions-card');
+  const histPanel = document.getElementById('pos-history-panel');
+  const perpCard = document.getElementById('perp-positions-card');
+
+  if(personalized){
+    // ── Member's own account: one unified position list with 一键平仓 ──
+    const mine = s.member_positions || [];
+    if(_changed('mpos', mine)) renderMemberPositions(mine);
     if(posCard) posCard.style.display = '';
-  }
-  if(s.feed){renderFeed(s.feed);}
-  if(s.closed_trades){renderHistory(s.closed_trades);}
-  // OKX mode: render real trades via paginated helper
-  if(s.okx_connected && s.okx_trades_history && s.okx_trades_history.length > 0){
-    renderOkxTrades(s.okx_trades_history);
+    // The simulator history table has no meaning for a real member account.
+    if(histPanel) histPanel.style.display = 'none';
+    // Avoid duplicating the same positions in a second panel.
+    if(perpCard) perpCard.style.display = 'none';
   } else {
-    if(s.swaps){renderSwaps(s.swaps, s.is_okx);}
+    if(histPanel) histPanel.style.display = '';
+    // OKX mode: render perp positions, skip simulator positions
+    if(s.perp_positions && s.perp_positions.length > 0){
+      if(_changed('ppos', s.perp_positions)) renderPerpPositions(s.perp_positions, s.perp_stats, s.perp_config);
+      // Hide simulator Open Positions card (shows nothing but takes up space)
+      if(posCard) posCard.style.display = 'none';
+    } else {
+      // Non-OKX mode: use simulator positions
+      if(s.positions && _changed('spos', s.positions)) renderPositions(s.positions);
+      if(posCard) posCard.style.display = '';
+    }
+  }
+
+  if(s.feed && _changed('feed', s.feed)) renderFeed(s.feed);
+  if(personalized){
+    // Only the member's own closed history — never the shared ledger.
+    if(s.closed_trades && _changed('hist', s.closed_trades)) renderHistory(s.closed_trades);
+  } else if(s.closed_trades && _changed('hist', s.closed_trades)){
+    renderHistory(s.closed_trades);
+  }
+  // OKX fills: real trades for the active account
+  if(personalized){
+    if(_changed('okxtr', s.okx_trades_history || [])) renderOkxTrades(s.okx_trades_history || []);
+  } else if(s.okx_connected && s.okx_trades_history && s.okx_trades_history.length > 0){
+    if(_changed('okxtr', s.okx_trades_history)) renderOkxTrades(s.okx_trades_history);
+  } else {
+    if(s.swaps && _changed('swaps', s.swaps)) renderSwaps(s.swaps, s.is_okx);
   }
   if(s.snap){}
   if(s.okx_connected !== undefined) updateLandingState(s.okx_connected, s.data_source);
-  if(s.decisions && Array.isArray(s.decisions)) renderDecisions(s.decisions);
+  if(s.decisions && Array.isArray(s.decisions) && _changed('dec', s.decisions)) renderDecisions(s.decisions);
   if(s.today_pnl !== undefined) updateTodayPnl(s.today_pnl);
   if(s.risk_pct !== undefined) updateRiskBar(s.risk_pct, s.risk_limit || 8);
+  // Keep the Trade History page live while it is open (source switched between
+  // OKX round trips and the legacy DB ledger depending on mode).
+  const tradesPageEl = document.getElementById('page-trades');
+  if(tradesPageEl && tradesPageEl.classList.contains('active')) loadTradesPage();
   drawEquity();
 }
 let _pollTimer=null;
@@ -1952,7 +2579,7 @@ function startPolling(){
   console.log('[RH] polling /api/desk-state every 1s');
   _pollTimer=setInterval(async()=>{
     try{
-      const r=await fetch('/api/desk-state',{cache:'no-store'});
+      const r=await fetch('/api/desk-state',{cache:'no-store',credentials:'same-origin'});
       if(r.ok){const s=await r.json();applyDeskState(s);}
     }catch(e){}
   },1000);
@@ -2368,7 +2995,7 @@ function renderFeed(feed){
   const items = (feed||[]).map((f,i)=>{
     const cls = {ENTRY:'buy',EXIT:'sell',STOP:'sell',HALT:'halt',LEARN:'buy',REJECT:'reject',NOT_BUY:'reject'}[f.side] || 'all';
     const pnlCls = {ENTRY:'side-buy',EXIT:'side-sell',STOP:'pnl-neg',HALT:'side-sell'}[f.side] || 'side-sell';
-    const pnlText = {ENTRY:'ENTRY',EXIT:'EXIT',STOP:'STOP',HALT:'HALTED',REJECT:'BLOCKED',NOT_BUY:'SKIP'}[f.side] || f.side;
+    const pnlText = tSide(f.side);
     // Use original timestamp from feed, not current time
     let timeStr = '';
     if (f.t) {
@@ -2376,7 +3003,7 @@ function renderFeed(feed){
       timeStr = d.toLocaleTimeString('en-GB',{hour12:false,hour:'2-digit',minute:'2-digit'});
     }
     return `<div class="feed-item" data-type="${cls}"><div class="feed-time">${timeStr}</div>
-      <div class="feed-body"><div class="feed-ticker"><span class="side-${cls==='buy'?'buy':'sell'}">${f.side}</span> ${f.ticker} · ${f.mult.toFixed(2)}x</div>
+      <div class="feed-body"><div class="feed-ticker"><span class="side-${cls==='buy'?'buy':'sell'}">${tSide(f.side)}</span> ${f.ticker} · ${f.mult.toFixed(2)}x</div>
       <div class="feed-note">${f.note||''}</div></div><div class="feed-pnl ${pnlCls}">${pnlText}</div></div>`;
   }).join('');
   // Only update if content changed (avoid unnecessary DOM refresh)
@@ -2436,11 +3063,22 @@ if(typeof applyDeskState !== 'undefined'){
     if(s.okx_trades_history) window.__okxTradeHistory = s.okx_trades_history;
 
     // ── 1. Topbar: EQUITY / 24h PnL / WIN RATE / TRADES / KELLY ──
+    // In OKX mode, EQUITY must come from the OKX sim account. When the account
+    // snapshot has not been fetched yet, show a placeholder instead of falling
+    // back to simulator bankroll (500) — that value is DEMO data.
     const eqEl = document.getElementById('topbar-equity');
     if(eqEl){
-      const eqVal = okxBalance ? okxBalance.total_eq_usd : (mon.bankroll||0);
-      eqEl.textContent = '$'+eqVal.toFixed(2);
-      eqEl.className = 'topbar-stat-val '+(mon.multiple>=1?'up':'down');
+      const isOkx = !!(s.okx_connected || s.is_okx);
+      if(isOkx && okxBalance){
+        eqEl.textContent = '$'+okxBalance.total_eq_usd.toFixed(2);
+        eqEl.className = 'topbar-stat-val up';
+      } else if(isOkx){
+        eqEl.textContent = '— OKX account not fetched —';
+        eqEl.className = 'topbar-stat-val down';
+      } else {
+        eqEl.textContent = '$'+(mon.bankroll||0).toFixed(2);
+        eqEl.className = 'topbar-stat-val '+(mon.multiple>=1?'up':'down');
+      }
       // Show spot + perp breakdown when in OKX mode
       const bkdnEl = document.getElementById('equity-breakdown');
       if(bkdnEl && okxBalance){
@@ -2456,13 +3094,23 @@ if(typeof applyDeskState !== 'undefined'){
     // 24h PnL — consume mon.pnl_24h (backend-computed)
     const pnl24 = mon.pnl_24h !== undefined ? mon.pnl_24h : 0;
     const startBank = mon.start_bankroll && mon.start_bankroll>0 ? mon.start_bankroll : 500;
+    const isOkxPnl = !!(s.okx_connected || s.is_okx);
     const pnlPct = okxBalance
       ? ((okxBalance.total_eq_usd - startBank) / startBank * 100).toFixed(2)
       : ((mon.bankroll - startBank) / startBank * 100).toFixed(2);
     const pnlEl = document.getElementById('topbar-pnl');
     if(pnlEl){
-      const realPnl = okxBalance ? okxBalance.total_eq_usd - startBank : pnl24;
-      pnlEl.textContent = (realPnl>=0?'+':'-')+'$'+Math.abs(realPnl).toFixed(0)+' ('+(realPnl>=0?'+':'')+pnlPct+'%)';
+      let realPnl;
+      if(okxBalance){
+        realPnl = okxBalance.total_eq_usd - startBank;
+        pnlEl.textContent = (realPnl>=0?'+':'-')+'$'+Math.abs(realPnl).toFixed(0)+' ('+(realPnl>=0?'+':'')+pnlPct+'%)';
+      } else if(isOkxPnl){
+        realPnl = 0;
+        pnlEl.textContent = '— awaiting OKX account —';
+      } else {
+        realPnl = pnl24;
+        pnlEl.textContent = (realPnl>=0?'+':'-')+'$'+Math.abs(realPnl).toFixed(0)+' ('+(realPnl>=0?'+':'')+pnlPct+'%)';
+      }
       pnlEl.className = 'topbar-stat-val '+(realPnl>=0?'up':'down');
     }
 
@@ -2480,18 +3128,26 @@ if(typeof applyDeskState !== 'undefined'){
     if(tradesEl) tradesEl.textContent = mon.total_trades !== undefined ? mon.total_trades : ((s.closed_trades||[]).length + (mon.open_count||0));
 
     // Kelly Used — consume mon.full_kelly / mon.used_kelly + atr_pct
+    // In OKX mode, a hardcoded KELLY value (0.453 / 0.5) is DEMO data —
+    // only show it when the OKX sim account snapshot is actually available.
     const kellyFull = mon.full_kelly !== undefined ? mon.full_kelly : (snap.full_kelly !== undefined ? snap.full_kelly : null);
     const kellyUsed = mon.used_kelly !== undefined ? mon.used_kelly : (snap.used_kelly !== undefined ? snap.used_kelly : null);
     const kellyEl = document.getElementById('topbar-kelly');
     const kellyCard = document.getElementById('mon-kelly-panel');
     const kellySub = document.getElementById('mon-kelly-sub');
-    if(kellyEl) kellyEl.textContent = kellyFull !== null ? kellyFull.toFixed(3) : '—';
-    if(kellyCard) kellyCard.textContent = kellyFull !== null ? kellyFull.toFixed(3) : '—';
+    const kellyIsOkx = !!(s.okx_connected || s.is_okx);
+    const kellyShowVal = (kellyFull !== null) && (!kellyIsOkx || okxBalance);
+    if(kellyEl) kellyEl.textContent = kellyShowVal ? kellyFull.toFixed(3) : (kellyIsOkx ? '— no OKX data —' : '—');
+    if(kellyCard) kellyCard.textContent = kellyShowVal ? kellyFull.toFixed(3) : (kellyIsOkx ? '— no OKX data —' : '—');
     if(kellySub) {
-      const atr = mon.atr_pct !== undefined ? mon.atr_pct*100 : 0;
-      const vp = mon.vol_penalty !== undefined ? mon.vol_penalty : 1.0;
-      kellySub.innerHTML = 'used: '+ (kellyUsed!==null?kellyUsed.toFixed(3):'—')
-        + '  <span style="opacity:.5">· atr '+atr.toFixed(1)+'% · pen '+vp.toFixed(2)+'</span>';
+      if(kellyIsOkx && !okxBalance){
+        kellySub.innerHTML = '— OKX account not fetched —';
+      } else {
+        const atr = mon.atr_pct !== undefined ? mon.atr_pct*100 : 0;
+        const vp = mon.vol_penalty !== undefined ? mon.vol_penalty : 1.0;
+        kellySub.innerHTML = 'used: '+ (kellyUsed!==null?kellyUsed.toFixed(3):'—')
+          + '  <span style="opacity:.5">· atr '+atr.toFixed(1)+'% · pen '+vp.toFixed(2)+'</span>';
+      }
     }
 
     // ── 2. Metrics Row sub-labels ──
@@ -2506,9 +3162,15 @@ if(typeof applyDeskState !== 'undefined'){
       posSub.textContent = spotN+' spot'+(perpN?' · '+perpN+' perp':'');
     }
     // Builder card sub-label — pseudo commission
+    // In OKX mode the pseudo-commission is simulator data; only show it when
+    // the OKX sim account is actually fetched, otherwise mark it unavailable.
     const builderComm = mon.comm_pseudo !== undefined ? mon.comm_pseudo : 0;
     const builderCard = document.querySelector('.metrics-row .metric-card:nth-child(5) .metric-sub');
-    if(builderCard) builderCard.textContent = 'Comm pseudo: $'+builderComm.toFixed(2);
+    const builderIsOkx = !!(s.okx_connected || s.is_okx);
+    if(builderCard){
+      if(builderIsOkx && !okxBalance) builderCard.textContent = '— awaiting OKX account —';
+      else builderCard.textContent = 'Comm pseudo: $'+builderComm.toFixed(2);
+    }
 
     // ── 3. Sidebar badge ──
     const navPos = document.getElementById('nav-positions-count');
@@ -2519,7 +3181,11 @@ if(typeof applyDeskState !== 'undefined'){
 
     // ── 5. Legacy monitor IDs (fallback for old JS) ──
     const bankLegacy = document.getElementById('mon-bank');
-    if(bankLegacy) bankLegacy.textContent = '$'+(okxBalance ? okxBalance.total_eq_usd : (mon.bankroll||0)).toFixed(2);
+    if(bankLegacy){
+      if(okxBalance) bankLegacy.textContent = '$'+okxBalance.total_eq_usd.toFixed(2);
+      else if(!(s.okx_connected || s.is_okx)) bankLegacy.textContent = '$'+(mon.bankroll||0).toFixed(2);
+      else bankLegacy.textContent = '— OKX not fetched —';
+    }
     const multLegacy = document.getElementById('mon-mult');
     if(multLegacy) multLegacy.textContent = (mon.multiple||1).toFixed(2)+'x';
     const entryLegacy = document.getElementById('mon-entry');
@@ -2554,6 +3220,19 @@ if(typeof applyDeskState !== 'undefined'){
       // 6e. Bankroll sub-label → OKX Real
       const bankCardSub = document.querySelector('.metrics-row .metric-card:first-child .metric-sub');
       if(bankCardSub && bankCardSub.textContent !== 'OKX Real') bankCardSub.textContent = 'OKX Real';
+    } else if(s.okx_connected || s.is_okx){
+      // OKX mode but account not fetched yet — keep simulator panels HIDDEN
+      // (they would show demo data). Show a clear "awaiting OKX account" hint.
+      document.querySelectorAll('#positions-card .panel-header').forEach(el=>{
+        if((el.textContent||'').includes('History')){
+          const wrap = el.parentElement;
+          if(wrap) wrap.style.display = 'none';
+        }
+      });
+      const decCard = document.getElementById('decision-log-card');
+      if(decCard) decCard.style.display = 'none';
+      const bankCardSub = document.querySelector('.metrics-row .metric-card:first-child .metric-sub');
+      if(bankCardSub) bankCardSub.textContent = 'OKX account not fetched';
     } else {
       // Non-OKX mode: restore simulator modules
       document.querySelectorAll('#positions-card .panel-header').forEach(el=>{
@@ -2564,6 +3243,8 @@ if(typeof applyDeskState !== 'undefined'){
       });
       const decCard = document.getElementById('decision-log-card');
       if(decCard) decCard.style.display = '';
+      const bankCardSub = document.querySelector('.metrics-row .metric-card:first-child .metric-sub');
+      if(bankCardSub) bankCardSub.textContent = '1.00x';
     }
   };
 }
@@ -2662,13 +3343,39 @@ const TRADES_PAGE_SIZE = 25;
 async function loadTradesPage(offset){
   if(offset!==undefined) _tradesPage = offset;
   try{
-    const r = await fetch('/api/trades?action=list&limit='+TRADES_PAGE_SIZE+'&offset='+(_tradesPage*TRADES_PAGE_SIZE));
-    const json = await r.json();
-    const rows = json.trades||[];
-    const total = json.total||0;
-    // Stats
-    const wins = rows.filter(t=>t.win).length;
-    const totalPnl = rows.reduce((s,t)=>s+(t.pnl_usd||0),0);
+    // OKX mode → OKX's own realized round trips, derived from /trade/fills by
+    // FIFO-pairing the executions. The DB table holds only the desk's paper
+    // replay, which no exchange order ever backed, so it is never shown here.
+    const ds = window.__lastDeskState || {};
+    const isOkx = !!(ds.okx_real_balance || ds.is_okx);
+    // The subtitle has to name the real data source for the active mode.
+    const subEl = document.querySelector('#page-trades .page-subtitle');
+    if(subEl) subEl.textContent = isOkx ? t('pg_trades_sub_okx') : t('pg_trades_sub');
+    let rows, total, statRows;
+    if(isOkx){
+      const rt = ds.okx_round_trips || [];
+      if(rt.length){
+        total = rt.length;
+        statRows = rt;
+        rows = rt.slice(_tradesPage*TRADES_PAGE_SIZE, (_tradesPage+1)*TRADES_PAGE_SIZE);
+      } else {
+        // OKX mode but the /trade/fills pairer returned nothing yet — fall back
+        // to the raw fills so the page is never blank.
+        const fills = ds.okx_trades_history || [];
+        total = fills.length;
+        statRows = fills;
+        rows = fills.slice(_tradesPage*TRADES_PAGE_SIZE, (_tradesPage+1)*TRADES_PAGE_SIZE);
+      }
+    } else {
+      const r = await fetch('/api/trades?action=list&limit='+TRADES_PAGE_SIZE+'&offset='+(_tradesPage*TRADES_PAGE_SIZE));
+      const json = await r.json();
+      rows = json.trades||[];
+      total = json.total||0;
+      statRows = rows;
+    }
+    // Stats (computed over every trade, not just the current page)
+    const wins = statRows.filter(t=>t.win).length;
+    const totalPnl = statRows.reduce((s,t)=>s+(t.pnl_usd||0),0);
     const elTotal = document.getElementById('tr-stat-total');
     const elWinrate = document.getElementById('tr-stat-winrate');
     const elPnl = document.getElementById('tr-stat-pnl');
@@ -2678,7 +3385,7 @@ async function loadTradesPage(offset){
     if(elPnl){ elPnl.textContent=(totalPnl>=0?'+':'')+'$'+totalPnl.toFixed(2); elPnl.className='metric-value '+(totalPnl>=0?'up':'down'); }
     if(elAvg) elAvg.textContent = total>0?'$'+(totalPnl/total).toFixed(2):'—';
     const statEl = document.getElementById('trades-stat');
-    if(statEl) statEl.textContent = total+' trades total';
+    if(statEl) statEl.textContent = total + ' ' + t('trades_count');
     // Table
     const tbody = document.getElementById('trades-body');
     if(!tbody) return;
@@ -2691,13 +3398,13 @@ async function loadTradesPage(offset){
         return `<tr>
           <td style="color:var(--text-dim)">${t.id||'—'}</td>
           <td><b>${t.ticker||'—'}</b></td>
-          <td><span class="badge ${t.side==='EXIT'?'red':'green'}">${t.side||'—'}</span></td>
+          <td><span class="badge ${(t.side==='EXIT'||t.side==='SHORT')?'red':'green'}">${tSide(t.side)}</span></td>
           <td>$${(t.entry_usd||0).toFixed(2)}</td>
           <td>$${(t.exit_usd||0).toFixed(2)}</td>
           <td class="${pnlClass}">${(t.pnl_usd>=0?'+':'')}$${Math.abs(t.pnl_usd||0).toFixed(2)}</td>
           <td>${(t.pnl_mult||0).toFixed(3)}x</td>
-          <td><span class="badge ${t.win?'green':'red'}">${t.win?'WIN':'LOSS'}</span></td>
-          <td><span class="tag ${t.platform==='okx'?'tag-okx':'tag-jup'}">${t.platform==='okx'?'OKX':'JUP'}</span></td>
+          <td><span class="badge ${t.win?'green':'red'}">${tWin(t.win)}</span></td>
+          <td><span class="tag ${String(t.platform||'').toLowerCase()==='okx'?'tag-okx':'tag-jup'}" title="${t.platform==='PAPER'?t('tip_paper_replay'):''}">${String(t.platform||'JUP').toUpperCase()}</span></td>
           <td style="max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-dim)" title="${t.why||''}">${(t.why||'').slice(0,30)}</td>
           <td style="color:var(--text-dim);font-size:10px">${exitTs}</td>
         </tr>`;
@@ -2738,17 +3445,28 @@ function refreshPositionsPage(){
   const spotBadge = document.getElementById('spot-pos-badge');
   if(spotBadge) spotBadge.textContent = holdings.length;
   if(spotBody){
-    if(!holdings.length){ spotBody.innerHTML='<tr><td colspan="6" class="empty-row">— no spot holdings —</td></tr>'; }
+    if(!holdings.length){ spotBody.innerHTML='<tr><td colspan="7" class="empty-row">— no spot holdings —</td></tr>'; }
     else {
       spotBody.innerHTML = holdings.map(h=>{
         const coin = h.ccy||h.coin||h.asset||'—';
-        const total = parseFloat(h.spot_bal||h.total||0).toFixed(6);
-        const avail = parseFloat(h.available_bal||h.available||0).toFixed(6);
-        const locked = parseFloat(h.locked||0).toFixed(6);
-        const usdVal = parseFloat(h.eq_usd||h.usd_value||h.quote_cnt||0).toFixed(2);
-        const pnl = h.upl!==undefined?((h.upl>=0?'+':'')+'$'+Math.abs(h.upl).toFixed(2)):'—';
-        const pnlPct = h.pnl_pct!==undefined?((h.pnl_pct>=0?'+':'')+h.pnl_pct.toFixed(2)+'%'):'—';
-        return `<tr><td><b>${coin}</b></td><td>${total}</td><td>${avail}</td><td>${locked}</td><td class="up">$${usdVal}</td><td>${pnl}</td></tr>`;
+        const qty = parseFloat(h.spot_bal||h.total||0);
+        const eqUsd = parseFloat(h.eq_usd||h.usd_value||h.quote_cnt||0);
+        const upl = parseFloat(h.upl||0);
+        const cost = eqUsd - upl;
+        const avgPx = qty>0 && cost>0 ? cost/qty : 0;
+        const markPx = qty>0 ? eqUsd/qty : 0;
+        const pnlPct = cost>0 ? (upl/cost*100) : 0;
+        const cls = upl>=0?'up':'down';
+        const sign = upl>=0?'+':'';
+        return `<tr>
+          <td><b>${coin}</b></td>
+          <td>${qty.toFixed(6)}</td>
+          <td>$${avgPx.toFixed(6)}</td>
+          <td>$${markPx.toFixed(6)}</td>
+          <td class="${cls}">${sign}$${Math.abs(upl).toFixed(2)}</td>
+          <td class="${cls}">${sign}${pnlPct.toFixed(2)}%</td>
+          <td>${closeBtn('spot', coin+'-USDT', coin, 'LONG', eqUsd)}</td>
+        </tr>`;
       }).join('');
     }
   }
@@ -2758,19 +3476,21 @@ function refreshPositionsPage(){
   const perpBadge = document.getElementById('perp-pos-badge-page');
   if(perpBadge) perpBadge.textContent = perpPositions.length;
   if(perpBody){
-    if(!perpPositions.length){ perpBody.innerHTML='<tr><td colspan="7" class="empty-row">— no perp positions —</td></tr>'; }
+    if(!perpPositions.length){ perpBody.innerHTML='<tr><td colspan="8" class="empty-row">— no perp positions —</td></tr>'; }
     else {
       perpBody.innerHTML = perpPositions.map(p=>{
         const pnlPct = p.pnl_pct !== undefined ? (p.pnl_pct>=0?'+':'')+p.pnl_pct.toFixed(2)+'%' : '—';
-        const pnlClass = (p.pnl_usd||0)>=0?'up':'down';
+        const pnlClass = (p.pnl_usd||p.upl||0)>=0?'up':'down';
+        const pnlUsd = p.pnl_usd!==undefined ? p.pnl_usd : (p.upl||0);
         return `<tr>
           <td><b>${p.ticker||'—'}</b></td>
-          <td><span class="badge ${p.side==='LONG'?'green':'red'}">${p.side||'—'}</span></td>
-          <td>$${(p.entry_usd||0).toFixed(2)}</td>
-          <td>$${(p.notional||0).toFixed(2)}</td>
-          <td>${p.leverage||'—'}x</td>
-          <td class="${pnlClass}">${(p.pnl_usd>=0?'+':'')}$${Math.abs(p.pnl_usd||0).toFixed(2)}</td>
+          <td><span class="badge ${p.side==='LONG'?'green':'red'}">${tSide(p.side)}</span></td>
+          <td>$${(p.entry_usd||p.avg_px||0).toFixed(2)}</td>
+          <td>$${(p.notional||p.size_usd||0).toFixed(2)}</td>
+          <td>${p.leverage||p.lever||'—'}x</td>
+          <td class="${pnlClass}">${(pnlUsd>=0?'+':'')}$${Math.abs(pnlUsd).toFixed(2)}</td>
           <td class="${pnlClass}">${pnlPct}</td>
+          <td>${closeBtn('perp', p.inst_id||((p.ticker||'')+'-USDT-SWAP'), p.ticker, p.side, p.size_usd||p.notional)}</td>
         </tr>`;
       }).join('');
     }
@@ -2783,13 +3503,14 @@ function refreshPositionsPage(){
 function loadSpotPage(){
   window.__spot_loaded = true;
   const s = window.__lastDeskState || {};
-  const bal = s.okx_real_balance || {};
+  const bal = s.okx_real_balance || null;
   const eqEl = document.getElementById('okx-spot-equity');
   const availEl = document.getElementById('okx-spot-avail');
   const holdEl = document.getElementById('okx-spot-holdings');
-  if(eqEl) eqEl.textContent = '$'+(bal.total_eq_usd||0).toFixed(2);
-  if(availEl) availEl.textContent = '$'+(bal.usdt_avail||0).toFixed(2);
-  if(holdEl) holdEl.textContent = '$'+(bal.usdt_eq||0).toFixed(2);
+  const ph = '— OKX not fetched —';
+  if(eqEl) eqEl.textContent = bal ? '$'+(bal.total_eq_usd||0).toFixed(2) : ph;
+  if(availEl) availEl.textContent = bal ? '$'+(bal.usdt_avail||0).toFixed(2) : ph;
+  if(holdEl) holdEl.textContent = bal ? '$'+(bal.usdt_eq||0).toFixed(2) : ph;
   const holdings = s.okx_spot_holdings || [];
   const body = document.getElementById('okx-spot-holdings-body');
   if(body){
@@ -2818,7 +3539,7 @@ function loadSpotPage(){
         const qty = parseFloat(tr.orig_qty||tr.size||0).toFixed(6);
         const filled = parseFloat(tr.filled_qty||tr.cum_quote||0).toFixed(6);
         const fee = parseFloat(tr.realized_fee||tr.fee||0).toFixed(6);
-        return `<tr><td style="color:var(--text-dim);font-size:10px">${ts}</td><td><b>${tr.inst_id||tr.symbol||'—'}</b></td><td><span class="badge ${side==='SELL'?'red':'green'}">${side}</span></td><td>$${price}</td><td>${qty}</td><td>${filled}</td><td style="color:var(--text-dim)">${fee}</td></tr>`;
+        return `<tr><td style="color:var(--text-dim);font-size:10px">${ts}</td><td><b>${tr.inst_id||tr.symbol||'—'}</b></td><td><span class="badge ${side==='SELL'?'red':'green'}">${tSide(side)}</span></td><td>$${price}</td><td>${qty}</td><td>${filled}</td><td style="color:var(--text-dim)">${fee}</td></tr>`;
       }).join('');
     }
   }
@@ -2830,15 +3551,15 @@ function loadSpotPage(){
 function loadPerpPage(){
   window.__perp_loaded = true;
   const s = window.__lastDeskState || {};
-  const bal = s.okx_real_balance || {};
+  const bal = s.okx_real_balance || null;
   const perpPositions = s.perp_positions || [];
   const eqEl = document.getElementById('okx-perp-equity');
   const uplEl = document.getElementById('okx-perp-upl');
   const countEl = document.getElementById('okx-perp-positions-count');
-  if(eqEl) eqEl.textContent = '$'+(bal.total_eq_usd||0).toFixed(2);
+  if(eqEl) eqEl.textContent = bal ? '$'+(bal.total_eq_usd||0).toFixed(2) : '— OKX not fetched —';
   if(uplEl){
-    const upl = bal.perp_upl||0;
-    uplEl.textContent = (upl>=0?'+':'')+'$'+Math.abs(upl).toFixed(2);
+    const upl = bal ? (bal.perp_upl||0) : 0;
+    uplEl.textContent = bal ? ((upl>=0?'+':'')+'$'+Math.abs(upl).toFixed(2)) : '—';
     uplEl.className = 'metric-value '+(upl>=0?'up':'down');
   }
   if(countEl) countEl.textContent = perpPositions.length;
@@ -2852,21 +3573,30 @@ function loadPerpPage(){
   if(holdEl) holdEl.textContent = ((cfg.max_hold_sec||1800)/60).toFixed(0)+' min';
   const body = document.getElementById('okx-perp-body');
   if(body){
-    if(!perpPositions.length){ body.innerHTML='<tr><td colspan="9" class="empty-row">— no perp positions —</td></tr>'; }
+    if(!perpPositions.length){ body.innerHTML='<tr><td colspan="10" class="empty-row">— no perp positions —</td></tr>'; }
     else {
       body.innerHTML = perpPositions.map(p=>{
-        const pnlPct = p.pnl_pct!==undefined?(p.pnl_pct>=0?'+':'')+p.pnl_pct.toFixed(2)+'%':'—';
-        const pnlClass = (p.pnl_usd||0)>=0?'up':'down';
+        const upl = p.upl!==undefined ? p.upl : (p.pnl_usd||0);
+        const entryPx = p.avg_px||p.entry_px||0;
+        const markPx = p.last_px||p.mark_price||p.current_price||0;
+        const entryUsd = p.entry_usd || (entryPx * Math.abs(p.size||0));
+        const pnlUsd = p.pnl_usd!==undefined ? p.pnl_usd : upl;
+        const pnlPct = p.pnl_pct!==undefined ? p.pnl_pct
+                     : (entryUsd>0 ? upl/entryUsd*100 : 0);
+        const pnlClass = pnlUsd>=0?'up':'down';
+        const sign = pnlUsd>=0?'+':'';
+        const notional = p.notional||p.size_usd||0;
         return `<tr>
           <td><b>${p.ticker||'—'}</b></td>
-          <td><span class="badge ${p.side==='LONG'?'green':'red'}">${p.side||'—'}</span></td>
-          <td>$${(p.notional||p.entry_usd||0).toFixed(2)}</td>
-          <td>$${(p.entry_usd||0).toFixed(2)}</td>
-          <td>$${(p.mark_price||p.current_price||0).toFixed(6)}</td>
-          <td>${p.leverage||'—'}x</td>
-          <td class="${pnlClass}">${(p.pnl_usd>=0?'+':'')}$${Math.abs(p.pnl_usd||0).toFixed(2)}</td>
-          <td class="${pnlClass}">${pnlPct}</td>
-          <td>$${(p.margin||0).toFixed(2)}</td>
+          <td><span class="badge ${p.side==='LONG'?'green':'red'}">${tSide(p.side)}</span></td>
+          <td>$${notional.toFixed(2)}</td>
+          <td>$${entryPx.toFixed(6)}</td>
+          <td>$${markPx.toFixed(6)}</td>
+          <td>${p.leverage||p.lever||'—'}x</td>
+          <td class="${pnlClass}">${sign}$${Math.abs(pnlUsd).toFixed(2)}</td>
+          <td class="${pnlClass}">${sign}${pnlPct.toFixed(2)}%</td>
+          <td>$${(p.margin||entryUsd/(parseFloat(p.leverage||p.lever)||1)).toFixed(2)}</td>
+          <td>${closeBtn('perp', p.inst_id||((p.ticker||'')+'-USDT-SWAP'), p.ticker, p.side, notional)}</td>
         </tr>`;
       }).join('');
     }
@@ -2893,7 +3623,9 @@ async function loadKellyPage(){
     const kellyHalf = kellyFull/2;
     const kellyQuarter = kellyFull/4;
     const eq = window.__lastDeskState?.okx_real_balance;
-    const bankroll = eq ? eq.total_eq_usd : 500;
+    // Do NOT fall back to hardcoded 500 (DEMO data). If the OKX sim account
+    // balance has not been fetched, show a placeholder.
+    const bankroll = eq ? eq.total_eq_usd : null;
     // Update Kelly display
     const setEl = (id,val,color)=>{const el=document.getElementById(id);if(el){el.textContent=val;el.style.color=color||'';}};
     setEl('kelly-winrate-display',(winRate*100).toFixed(1)+'%');
@@ -2901,8 +3633,8 @@ async function loadKellyPage(){
     setEl('kelly-full-display',kellyFull.toFixed(3));
     setEl('kelly-half-display',kellyHalf.toFixed(3));
     setEl('kelly-quarter-display',kellyQuarter.toFixed(3));
-    setEl('kelly-current-display','$'+bankroll.toFixed(2));
-    const util = kellyHalf>0 ? Math.min(100, (bankroll*0.02/kellyHalf/bankroll*100)).toFixed(0) : '—';
+    setEl('kelly-current-display', bankroll!==null ? '$'+bankroll.toFixed(2) : '— OKX account not fetched —');
+    const util = (bankroll!==null && kellyHalf>0) ? Math.min(100, (bankroll*0.02/kellyHalf/bankroll*100)).toFixed(0) : '—';
     setEl('kelly-util-display',util+'%');
     // Trade stats
     const setStat = (id,val)=>{const el=document.getElementById(id);if(el)el.textContent=val;};
@@ -2959,7 +3691,7 @@ async function loadReportsPage(offset){
             <td style="color:var(--text-dim)">${t.id||'—'}</td>
             <td style="color:var(--text-dim);font-size:10px">${ts}</td>
             <td><b>${t.ticker||'—'}</b></td>
-            <td><span class="badge ${t.side==='EXIT'?'red':'green'}">${t.side||'—'}</span></td>
+            <td><span class="badge ${t.side==='EXIT'?'red':'green'}">${tSide(t.side)}</span></td>
             <td>$${(t.entry_usd||0).toFixed(2)}</td>
             <td>$${(t.exit_usd||0).toFixed(2)}</td>
             <td class="${pnlClass}">${(t.pnl_usd>=0?'+':'')}$${Math.abs(t.pnl_usd||0).toFixed(2)}</td>
@@ -3099,6 +3831,7 @@ async function checkAuth(){
       _currentUser = r.auth;
       if(_authToken) localStorage.setItem('session_token', _authToken);
       updateAuthUI();
+      refreshAccountStatus();
     } else {
       _currentUser = null;
       _authToken = '';
@@ -3114,7 +3847,7 @@ function updateAuthUI(){
   if(_currentUser){
     el.innerHTML = `<span style="color:var(--green)">● ${_currentUser.username}</span> <span style="font-size:9px;color:var(--text-dim);margin-left:4px">[${_currentUser.tier}]</span> <a href="#" onclick="doLogout();return false;" style="font-size:9px;color:var(--text-dim);margin-left:4px">logout</a>`;
   } else {
-    el.innerHTML = `<button class="btn-secondary" onclick="showAuthModal()" style="font-size:10px;padding:3px 8px">Login / Register</button>`;
+    el.innerHTML = `<button class="btn-secondary" data-i18n="am_login_register" onclick="showAuthModal()" style="font-size:10px;padding:3px 8px">${t('am_login_register')}</button>`;
   }
 }
 
@@ -3168,6 +3901,11 @@ async function doLogin(){
       updateAuthUI();
       closeAuthModal();
       _authMsg('Logged in as '+r.username);
+      // Account context changed → drop memoised renders and re-pull the
+      // dashboard so it reflects this member's own OKX data immediately.
+      resetAccountView();
+      refreshAccountStatus();
+      setTimeout(refreshDeskStateNow, 400);
       if(_currentUser&&_currentUser.role==='admin') loadMembersPage();
       else if(_currentUser) loadMembersPage();
       if(document.getElementById('page-leaderboard')?.classList.contains('active')) loadLeaderboardPage();
@@ -3196,6 +3934,20 @@ async function doLogout(){
   _authToken = ''; _currentUser = null;
   localStorage.removeItem('session_token');
   updateAuthUI();
+  // Fall back to the shared system-default view.
+  resetAccountView();
+  refreshDeskStateNow();
+}
+
+// Drop every memoised render so the next payload repaints from scratch.
+function resetAccountView(){
+  Object.keys(_sigCache).forEach(k=>delete _sigCache[k]);
+  window.__positions_loaded = false;
+  _eqOkxAccum = []; _eqOkxLastSec = 0; eqW = []; eqV = [];
+  const histPanel = document.getElementById('pos-history-panel');
+  if(histPanel) histPanel.style.display = '';
+  const perpCard = document.getElementById('perp-positions-card');
+  if(perpCard) perpCard.style.display = 'none';
 }
 
 // ═══════════════════════════════════════════════════
@@ -3269,7 +4021,7 @@ async function loadMembersPage(){
   const userPanel = document.getElementById('members-user-panel');
   const subtitle = document.getElementById('members-subtitle');
   if(!loginMsg) return;
-  if(!_authToken){ loginMsg.style.display='block'; if(adminPanel) adminPanel.style.display='none'; if(userPanel) userPanel.style.display='none'; if(subtitle) subtitle.textContent='Log in to continue'; return; }
+  if(!_authToken){ loginMsg.style.display='block'; if(adminPanel) adminPanel.style.display='none'; if(userPanel) userPanel.style.display='none'; if(subtitle) subtitle.textContent=t('pg_members_sub'); return; }
   if(! _currentUser){ loginMsg.style.display='block'; if(adminPanel) adminPanel.style.display='none'; if(userPanel) userPanel.style.display='none'; return; }
   loginMsg.style.display='none';
   // Show user center for all logged-in users
@@ -3336,7 +4088,11 @@ async function loadUserSettings(){
     if(unlimitedCheck) unlimitedCheck.checked = timeUnlimited;
     if(timeUnlimited){ startInput.disabled=true; endInput.disabled=true; }
     const maxPos = document.getElementById('us-max-position');
-    if(maxPos) maxPos.value = _userSettingsCache.max_position_usd || 100;
+    const maxVal = (_userSettingsCache.max_trade_usd || _userSettingsCache.max_position_usd || 100);
+    if(maxPos) maxPos.value = maxVal;
+    const minTrade = document.getElementById('us-min-trade');
+    if(minTrade) minTrade.value = (_userSettingsCache.min_trade_usd !== undefined && _userSettingsCache.min_trade_usd !== null)
+      ? _userSettingsCache.min_trade_usd : 10;
     const tickers = document.getElementById('us-allowed-tickers');
     if(tickers) tickers.value = _userSettingsCache.allowed_tickers || '';
     _memberSelectedTickers = (_userSettingsCache.allowed_tickers || '').split(',').filter(t=>t.trim()).map(t=>t.trim().toUpperCase());
@@ -3353,6 +4109,7 @@ async function loadUserSettings(){
     if(apiSecretEl) apiSecretEl.value = _userSettingsCache.api_secret || '';
     if(apiPassEl) apiPassEl.value = _userSettingsCache.api_passphrase || '';
     updateApiStatusDisplay();
+    refreshAccountStatus();
   }catch(e){ console.error('loadUserSettings error:', e); }
 }
 
@@ -3401,46 +4158,100 @@ async function saveTradeSettings(){
   const endInput = document.getElementById('us-end-time');
   const unlimitedCheck = document.getElementById('us-time-unlimited');
   const maxPosInput = document.getElementById('us-max-position');
+  const minTradeInput = document.getElementById('us-min-trade');
   const tickersInput = document.getElementById('us-allowed-tickers');
   const tpInput = document.getElementById('us-take-profit');
   const slInput = document.getElementById('us-stop-loss');
+  const minTrade = parseFloat(minTradeInput?.value);
+  const maxTrade = parseFloat(maxPosInput?.value);
+  if(isNaN(minTrade) || isNaN(maxTrade) || minTrade < 0 || maxTrade <= 0){
+    alert(lang==='zh'?'请输入有效的单笔金额区间（最小/最大均需 ≥ 0）':'Enter a valid per-trade amount range (both ≥ 0)');
+    return;
+  }
+  if(minTrade > maxTrade){
+    alert(lang==='zh'?'单笔最小金额不能大于最大金额':'Min per-trade amount cannot exceed the max');
+    return;
+  }
   const settings = {
     risk_preference: riskOption ? riskOption.dataset.value : 'balanced',
     trade_mode: modeOption ? modeOption.dataset.value : 'signal_only',
     run_start_time: unlimitedCheck?.checked ? null : (startInput?.value || null),
     run_end_time: unlimitedCheck?.checked ? null : (endInput?.value || null),
-    max_position_usd: parseFloat(maxPosInput?.value) || 100,
+    min_trade_usd: minTrade,
+    max_trade_usd: maxTrade,
+    max_position_usd: maxTrade,
     allowed_tickers: (tickersInput?.value || '').trim(),
     take_profit_pct: parseFloat(tpInput?.value) || 3.0,
     stop_loss_pct: parseFloat(slInput?.value) || 1.5,
   };
   try{
-    const r = await fetch('/api/user/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(settings)}).then(res=>res.json());
+    const r = await fetch('/api/user/settings',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify(settings)}).then(res=>res.json());
     if(r.ok){
       _userSettingsCache = {..._userSettingsCache,...settings};
-      showToast(lang==='zh'?'交易设置已保存':'Trade settings saved');
+      showToast(lang==='zh'
+        ? `交易设置已保存 · 单笔 $${minTrade}–$${maxTrade}`
+        : `Trade settings saved · per-trade $${minTrade}–$${maxTrade}`);
     }else{
-      alert(r.error||'Save failed');
+      alert(r.msg||r.error||'Save failed');
     }
   }catch(e){ alert('Error: '+e.message); }
 }
 
 async function saveApiKeys(){
   if(!_currentUser) return;
-  const key = document.getElementById('us-api-key')?.value || '';
-  const secret = document.getElementById('us-api-secret')?.value || '';
-  const passphrase = document.getElementById('us-api-passphrase')?.value || '';
+  const key = (document.getElementById('us-api-key')?.value || '').trim();
+  const secret = (document.getElementById('us-api-secret')?.value || '').trim();
+  const passphrase = (document.getElementById('us-api-passphrase')?.value || '').trim();
+  const filled = [key, secret, passphrase].filter(v=>v).length;
+  if(filled !== 0 && filled !== 3){
+    alert(lang==='zh'
+      ? 'API Key / Secret / Passphrase 三项必须同时填写，否则无法连接你的 OKX 账户'
+      : 'API Key, Secret and Passphrase must be filled together, otherwise your OKX account cannot be connected');
+    return;
+  }
   const settings = { api_key: key, api_secret: secret, api_passphrase: passphrase };
   try{
-    const r = await fetch('/api/user/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(settings)}).then(res=>res.json());
+    const r = await fetch('/api/user/settings',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify(settings)}).then(res=>res.json());
     if(r.ok){
       _userSettingsCache = {..._userSettingsCache,...settings};
       updateApiStatusDisplay();
-      showToast(lang==='zh'?'API密钥已保存':'API keys saved');
+      if(filled === 3){
+        _sigCache['mpos'] = null; _sigCache['okxtr'] = null; _sigCache['hist'] = null;
+        showToast(lang==='zh'?'API 密钥已保存，正在同步你的 OKX 账户…':'API keys saved — syncing your OKX account…');
+        setTimeout(refreshAccountStatus, 1200);
+        setTimeout(refreshDeskStateNow, 2500);
+        setTimeout(refreshDeskStateNow, 6000);
+      } else {
+        showToast(lang==='zh'?'API 密钥已清除，将显示系统默认数据':'API keys cleared — showing system default data');
+        refreshAccountStatus();
+        refreshDeskStateNow();
+      }
     }else{
-      alert(r.error||'Save failed');
+      alert(r.msg||r.error||'Save failed');
     }
   }catch(e){ alert('Error: '+e.message); }
+}
+
+// Ask the server whether this member's own OKX account is driving the UI.
+async function refreshAccountStatus(){
+  const el = document.getElementById('us-api-status');
+  try{
+    const r = await fetch('/api/account/status',{credentials:'same-origin'}).then(x=>x.json());
+    if(!r || !r.authenticated) return;
+    if(el && r.personalized){
+      const connected = r.connected;
+      const err = r.error;
+      const color = err ? 'var(--red)' : (connected ? 'var(--green)' : 'var(--amber)');
+      const state = err
+        ? (lang==='zh'?'连接失败':'connection failed')
+        : (connected ? (lang==='zh'?'已连接 · 专属数据生效':'connected · own data live')
+                     : (lang==='zh'?'同步中…':'syncing…'));
+      el.innerHTML = `<span style="color:${color}">● ${state}</span>`
+        + (r.cache_age_sec>=0 ? ` <span style="color:var(--text-dim)">(${r.cache_age_sec}s ago)</span>` : '')
+        + (err ? `<div style="color:var(--red);margin-top:4px;word-break:break-all">${err}</div>` : '')
+        + `<div style="color:var(--text-dim);margin-top:4px">${lang==='zh'?'单笔限额':'per-trade'} $${r.trade_band.min}–$${r.trade_band.max}</div>`;
+    }
+  }catch(e){}
 }
 
 function updateApiStatusDisplay(){
@@ -3657,6 +4468,302 @@ class LiveHandler(BaseHTTPRequestHandler):
     def _clear_cookie(self, name: str) -> None:
         self.send_header(f"Set-Cookie", f"{name}=; Path=/; Max-Age=0")
 
+    # ── Response helpers: gzip + cross-client payload memo ────────────
+
+    def _wants_gzip(self) -> bool:
+        return "gzip" in (self.headers.get("Accept-Encoding") or "").lower()
+
+    def _send_bytes(self, code, body: bytes, content_type: str,
+                    extra: dict | None = None):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_desk_state(self, state: dict, tenant: int) -> None:
+        """Encode a desk-state payload once and share it between clients.
+
+        The state dict is replaced by the runner on every tick, so the pair
+        ``(id(state), tenant)`` identifies one immutable generation. Multiple
+        browsers polling the same generation reuse the same encoded bytes.
+        """
+        key = (id(state), tenant)
+        with _desk_cache_lock:
+            entry = _desk_payload_cache.get(key)
+            # The cached tuple keeps a strong reference to `state`, so its
+            # id() cannot be recycled by the allocator while it is cached.
+            if entry is None or entry[0] is not state:
+                entry = None
+        if entry is None:
+            raw = json.dumps(state, default=str).encode("utf-8")
+            gzb = gzip.compress(raw, 5) if len(raw) >= 1024 else None
+            entry = (state, raw, gzb)
+            with _desk_cache_lock:
+                _desk_payload_cache[key] = entry
+                if len(_desk_payload_cache) > _DESK_CACHE_MAX:
+                    for k in list(_desk_payload_cache)[:len(_desk_payload_cache) - _DESK_CACHE_MAX]:
+                        _desk_payload_cache.pop(k, None)
+        _state, raw, gzb = entry
+        extra = {"Cache-Control": "no-store"}
+        if self._wants_gzip() and gzb is not None:
+            extra["Content-Encoding"] = "gzip"
+            extra["Vary"] = "Accept-Encoding"
+            self._send_bytes(200, gzb, "application/json", extra)
+        else:
+            self._send_bytes(200, raw, "application/json", extra)
+
+    # ── Member identity / tenancy ─────────────────────────────────────
+
+    def _get_token(self, u=None) -> str:
+        tok = self._get_cookie_token()
+        if not tok and u is not None:
+            tok = (parse_qs(u.query).get("token") or [""])[0]
+        return tok
+
+    def _identity(self, u=None):
+        """Return ``(auth_info, settings)`` for this request.
+
+        ``(None, None)`` means anonymous — the caller then serves the shared
+        system-default data, which is exactly the required fallback.
+        """
+        if _runner is None or not hasattr(_runner, "db"):
+            return None, None
+        tok = self._get_token(u)
+        info = _runner.db.validate_session(tok) if tok else None
+        if not info:
+            return None, None
+        try:
+            settings = _runner.db.get_user_settings(info["user_id"])
+        except Exception:
+            settings = None
+        return info, settings
+
+    def _personal_tenant(self, info, settings) -> int | None:
+        """The member's own tenant id, or None when we must show system data."""
+        if info is None or _account_mgr is None:
+            return None
+        if not _account_mgr.has_keys(info["user_id"], settings):
+            return None
+        return int(info["user_id"])
+
+    def _handle_desk_state(self, u) -> None:
+        base = None
+        if _runner is not None and getattr(_runner, "_latest_state", None) is not None:
+            base = _runner._latest_state
+        elif _server is not None:
+            base = _server.get_latest_state()
+        if base is None:
+            self._send_json(404, {"error": "no desk state yet"})
+            return
+
+        info, settings = self._identity(u)
+        tenant = self._personal_tenant(info, settings)
+        if tenant is None:
+            # No member context, or the member has not saved an API key yet
+            # → system default data, completely unchanged.
+            self._send_desk_state(base, SYSTEM_UID)
+            return
+
+        snap = _account_mgr.snapshot(tenant)
+        if snap is None or not snap.get("balance"):
+            # Keys are configured but the member's snapshot is not warm yet.
+            # Never leak the shared account in the meantime.
+            self._send_desk_state(
+                self._pending_state(base, info, snap), tenant
+            )
+            return
+        self._send_desk_state(self._personalize_state(base, info, settings, snap), tenant)
+
+    # ── Member-scoped desk state ──────────────────────────────────────
+
+    @staticmethod
+    def _account_slices(state: dict) -> dict:
+        """Blank every field that would otherwise expose the shared account."""
+        monitor = dict(state.get("monitor") or {})
+        for k in ("bankroll", "multiple", "open_count", "pnl_24h", "risk_pct",
+                  "wins", "losses", "profit_rate", "win_rate"):
+            monitor[k] = 0
+        return {
+            "monitor": monitor,
+            "equity": [],
+            "positions": [],
+            "closed_trades": [],
+            "okx_real_balance": None,
+            "okx_trades_history": [],
+            "okx_spot_holdings": [],
+            "perp_positions": [],
+            "member_positions": [],
+            "today_pnl": 0,
+            "risk_pct": 0,
+            "okx_connected": False,
+        }
+
+    def _pending_state(self, base: dict, info, snap) -> dict:
+        st = dict(base)
+        st.update(self._account_slices(base))
+        st["personalized"] = True
+        st["account_owner"] = info["username"]
+        st["account_pending"] = True
+        st["account_error"] = (snap or {}).get("error") or "syncing your OKX account"
+        st["trade_band"] = UserAccountManager.amount_band(
+            _runner.db.get_user_settings(info["user_id"]) if _runner else None
+        )
+        return st
+
+    def _personalize_state(self, base: dict, info, settings, snap: dict) -> dict:
+        """Rebuild the account-level slices from the member's own OKX account."""
+        uid = int(info["user_id"])
+        bal = dict(snap.get("balance") or {})
+        holdings = list(bal.get("holdings") or [])
+        perp = list(snap.get("positions") or [])
+
+        def _fl(v, d=0.0):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return d
+
+        total_eq = _fl(bal.get("total_eq_usd"))
+        # Baseline = this member's own equity at the first snapshot of the day.
+        baseline = _fl(snap.get("baseline_eq")) or total_eq
+        spot_hot = [h for h in holdings
+                    if str(h.get("ccy") or "") != "USDT"
+                    and _fl(h.get("spot_bal")) > 1e-8]
+        perp_notional = sum(_fl(p.get("size_usd")) for p in perp)
+        spot_eq = sum(_fl(h.get("eq_usd")) for h in holdings)
+        risk_pct = round((perp_notional + spot_eq) / total_eq * 100, 1) if total_eq > 0 else 0.0
+        pnl_24h = round(total_eq - baseline, 2)
+
+        try:
+            closed = _runner.db.get_recent(limit=50, user_id=uid)
+        except Exception:
+            closed = []
+        wins = sum(1 for c in closed if c.get("win"))
+
+        monitor = dict(base.get("monitor") or {})
+        monitor.update({
+            "multiple": round(total_eq / baseline, 2) if baseline else 0,
+            "bankroll": round(total_eq, 2),
+            # The frontend derives its PnL sub-label from start_bankroll, so it
+            # must carry the member's own baseline.
+            "start_bankroll": round(baseline, 2),
+            "open_count": len(spot_hot) + len(perp),
+            "pnl_24h": pnl_24h,
+            "risk_pct": risk_pct,
+            "risk_limit": 8.0,
+            "state": "LIVE",
+            "wins": wins,
+            "losses": len(closed) - wins,
+        })
+
+        member_positions: list[dict] = []
+        for p in perp:
+            entry_usd = _fl(p.get("entry_usd"))
+            upl = _fl(p.get("upl"))
+            member_positions.append({
+                "ticker": p.get("ticker") or "",
+                "kind": "perp",
+                "inst_id": p.get("inst_id") or "",
+                "side": p.get("side") or "",
+                "qty": p.get("size"),
+                "entry_px": p.get("avg_px"),
+                "mark_px": p.get("last_px"),
+                "size_usd": round(_fl(p.get("size_usd")), 2),
+                "upl": round(upl, 2),
+                "pnl_pct": round(upl / entry_usd * 100, 2) if entry_usd else 0.0,
+                "leverage": p.get("lever"),
+                "margin": p.get("margin"),
+                "close_side": "sell" if p.get("side") == "LONG" else "buy",
+            })
+        for h in holdings:
+            ccy = str(h.get("ccy") or "")
+            if ccy == "USDT" or _fl(h.get("spot_bal")) <= 1e-8:
+                continue
+            eq_usd = _fl(h.get("eq_usd"))
+            upl = _fl(h.get("upl"))
+            cost = eq_usd - upl
+            member_positions.append({
+                "ticker": ccy,
+                "kind": "spot",
+                "inst_id": f"{ccy}-USDT",
+                "side": "LONG",
+                "qty": h.get("spot_bal"),
+                "entry_px": round(cost / _fl(h.get("spot_bal")), 8) if _fl(h.get("spot_bal")) else None,
+                "mark_px": round(eq_usd / _fl(h.get("spot_bal")), 8) if _fl(h.get("spot_bal")) else None,
+                "size_usd": round(eq_usd, 2),
+                "upl": round(upl, 2),
+                "pnl_pct": round(upl / cost * 100, 2) if cost > 0 else 0.0,
+                "leverage": None,
+                "margin": round(eq_usd, 2),
+                "close_side": "sell",
+            })
+
+        st = dict(base)
+        st.update({
+            "monitor": monitor,
+            "okx_real_balance": bal,
+            "okx_spot_holdings": holdings,
+            "okx_trades_history": list(snap.get("trades") or []),
+            "perp_positions": perp,
+            "member_positions": member_positions,
+            "positions": [],
+            "closed_trades": closed,
+            "today_pnl": pnl_24h,
+            "risk_pct": risk_pct,
+            "risk_limit": 8.0,
+            "okx_connected": True,
+            "is_okx": True,
+            "personalized": True,
+            "account_pending": False,
+            "account_error": snap.get("error"),
+            "account_owner": info["username"],
+            "account_cache_age_sec": round(time.time() - _fl(snap.get("ts")), 1),
+            "account_baseline_eq": round(baseline, 2),
+            "account_baseline_day": snap.get("baseline_day"),
+            "trade_band": UserAccountManager.amount_band(settings),
+            # No shared curve: the chart is rebuilt from this member's own
+            # OKX equity samples on the client.
+            "equity": [],
+        })
+        return st
+
+    def _account_status_payload(self, info, settings) -> dict:
+        uid = int(info["user_id"])
+        band = UserAccountManager.amount_band(settings)
+        st = _account_mgr.status(uid) if _account_mgr else {
+            "keys_configured": False, "cache_age_sec": -1,
+            "error": None, "connected": False,
+        }
+        return {
+            "ok": True,
+            "username": info["username"],
+            "personalized": bool(st.get("keys_configured")),
+            "trade_band": band,
+            **st,
+        }
+
+    def _okx_spot_payload(self, u) -> dict:
+        """Spot holdings for the Spot page.
+
+        A member with their own API key sees their own holdings; everybody
+        else sees the shared desk's. Served by both GET and POST so the
+        endpoint is usable from the browser console and from the app.
+        """
+        if _runner is None:
+            return {"ok": False, "error": "no runner"}
+        info, settings = self._identity(u)
+        tenant = self._personal_tenant(info, settings)
+        if tenant is not None:
+            snap = _account_mgr.snapshot(tenant) if _account_mgr else None
+            holdings = ((snap or {}).get("balance") or {}).get("holdings", [])
+            return {"ok": True, "holdings": holdings, "personalized": True}
+        holdings = getattr(_runner, "spot_holdings", []) or []
+        return {"ok": True, "holdings": holdings, "personalized": False}
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -3680,12 +4787,16 @@ class LiveHandler(BaseHTTPRequestHandler):
         elif u.path == "/api/swaps":
             self._send_json(200, _server.swaps_snapshot() if _server else {"pending": [], "submitted": [], "failed": []})
         elif u.path == "/api/desk-state":
-            if _runner is not None and hasattr(_runner, "_latest_state") and _runner._latest_state is not None:
-                self._send_json(200, _runner._latest_state)
-            elif _server is not None and _server.get_latest_state() is not None:
-                self._send_json(200, _server.get_latest_state())
-            else:
-                self._send_json(404, {"error": "no desk state yet"})
+            self._handle_desk_state(u)
+        elif u.path == "/api/account/status":
+            info, settings = self._identity(u)
+            if not info:
+                self._send_json(200, {"ok": True, "authenticated": False,
+                                      "personalized": False})
+                return
+            self._send_json(200, self._account_status_payload(info, settings))
+        elif u.path == "/api/okx/spot":
+            self._send_json(200, self._okx_spot_payload(u))
         elif u.path.startswith("/api/trades"):
             qs = parse_qs(u.query)
             limit = min(int(qs.get("limit", ["100"])[0]), 500)
@@ -3695,22 +4806,26 @@ class LiveHandler(BaseHTTPRequestHandler):
                 self._send_json(503, {"error": "no runner db"})
                 return
             db: TradeDB = _runner.db
+            # A member with their own API key sees only their own ledger;
+            # everybody else sees the shared system-default ledger.
+            info, settings = self._identity(u)
+            scope = self._personal_tenant(info, settings)
+            scope = SYSTEM_UID if scope is None else scope
             if action == "stats":
-                self._send_json(200, db.get_stats())
+                self._send_json(200, db.get_stats(user_id=scope))
             elif action == "clear":
-                token = self._get_cookie_token()
-                info = _runner.db.validate_session(token) if token else None
                 if not info:
                     self._send_json(401, {"error": "unauthorized"})
                     return
-                cnt = db.clear_all()
-                if _runner is not None:
+                cnt = db.clear_all(user_id=scope)
+                if _runner is not None and scope == SYSTEM_UID:
                     _runner.closed_trades = []
-                self._send_json(200, {"ok": True, "removed": cnt})
+                self._send_json(200, {"ok": True, "removed": cnt, "scope": scope})
             else:
-                rows = db.get_recent(limit=limit, offset=offset)
-                total = db.get_total_count()
-                self._send_json(200, {"trades": rows, "total": total, "limit": limit, "offset": offset})
+                rows = db.get_recent(limit=limit, offset=offset, user_id=scope)
+                total = db.get_total_count(user_id=scope)
+                self._send_json(200, {"trades": rows, "total": total,
+                                      "limit": limit, "offset": offset, "scope": scope})
         elif u.path == "/api/settings":
             if _runner is None or not hasattr(_runner, "db"):
                 self._send_json(503, {"error": "no runner db"})
@@ -3773,12 +4888,39 @@ class LiveHandler(BaseHTTPRequestHandler):
             if not _server:
                 self._send_json(500, {"ok": False, "error": "no server"})
                 return
+            ticker = data.get("ticker", "BONK")
+            side = data.get("side", "ENTRY")
+            usd = float(data.get("usd", 50) or 0)
+            # ── Enforce the per-trade amount band on every ENTRY ───────────
+            # A member with their own key uses their own limits; otherwise the
+            # shared desk limits from the ops settings table apply.
+            clamped_note = ""
+            info, settings = self._identity(u)
+            tenant = self._personal_tenant(info, settings)
+            band_src = settings
+            if tenant is None:
+                # Shared desk: only clamp when the ops settings actually define
+                # a band, otherwise leave the requested amount untouched.
+                gs = (_runner.db.get_all_settings()
+                      if _runner is not None and hasattr(_runner, "db") else {})
+                band_src = gs if any(
+                    k in gs for k in ("min_trade_usd", "max_trade_usd", "max_position_usd")
+                ) else None
+            if _account_mgr is not None and side.upper() == "ENTRY" and band_src is not None:
+                usd, clamped_note = _account_mgr.clamp_stake(
+                    tenant if tenant is not None else SYSTEM_UID, usd, band_src
+                )
             result = _server.manual_signal(
-                ticker=data.get("ticker", "BONK"),
-                side=data.get("side", "ENTRY"),
-                usd=float(data.get("usd", 50)),
-                note=f"manual signal via dashboard",
+                ticker=ticker,
+                side=side,
+                usd=usd,
+                note=("manual signal via dashboard"
+                      + (f" by {info['username']}" if info else "")
+                      + (f" [{clamped_note}]" if clamped_note else "")),
             )
+            result["usd"] = round(usd, 2)
+            if clamped_note:
+                result["clamped"] = clamped_note
             self._send_json(200, result)
         elif u.path == "/api/price/sol":
             if not _server:
@@ -3822,16 +4964,82 @@ class LiveHandler(BaseHTTPRequestHandler):
                 print(f"[LIVE_SERVER] trade_mode updated → {mode}")
                 self._send_json(200, {"ok": True, "trade_mode": mode})
                 return
-        elif u.path == "/api/okx/spot":
-            # Return cached OKX spot holdings for the Spot page
-            if _runner is None:
-                self._send_json(503, {"error": "no runner"})
+            # Handle entry-signal source update: "real" (OKX candles) / "legacy"
+            if "signal_mode" in data and data.get("signal_mode"):
+                smode = str(data["signal_mode"]).lower()
+                if smode not in ("real", "legacy"):
+                    self._send_json(400, {"ok": False, "error": "signal_mode must be 'real' or 'legacy'"})
+                    return
+                db.set_setting("signal_mode", smode)
+                if _runner is not None and hasattr(_runner, "_reload_perp_settings"):
+                    _runner._reload_perp_settings()
+                print(f"[LIVE_SERVER] signal_mode updated → {smode}")
+                self._send_json(200, {"ok": True, "signal_mode": smode})
                 return
-            holdings = getattr(_runner, "spot_holdings", []) or []
-            self._send_json(200, {"ok": True, "holdings": holdings})
+        elif u.path == "/api/okx/spot":
+            # Legacy POST alias — kept so older front-ends keep working.
+            # See _okx_spot_payload().
+            payload = self._okx_spot_payload(u)
+            self._send_json(200 if payload.get("ok") else 503, payload)
+        elif u.path == "/api/position/close":
+            # ── One-click manual close ────────────────────────────────────
+            # Always executes against the member's OWN OKX credentials. The
+            # shared/showcase account can never be touched from the browser.
+            if _runner is None or not hasattr(_runner, "db"):
+                self._send_json(503, {"ok": False, "error": "no runner db"})
+                return
+            info, settings = self._identity(u)
+            if not info:
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            if _account_mgr is None or not _account_mgr.has_keys(info["user_id"], settings):
+                self._send_json(403, {
+                    "ok": False,
+                    "error": "no_api_key",
+                    "msg": "Configure your own OKX API key (Trade Settings → API Keys) "
+                           "before closing positions.",
+                })
+                return
+            result = _account_mgr.close_position(info["user_id"], {
+                "kind": data.get("kind"),
+                "inst_id": data.get("inst_id"),
+                "ticker": data.get("ticker"),
+                "side": data.get("side"),
+                "size_usd": data.get("size_usd"),
+            }, settings)
+            if result.get("ok"):
+                try:
+                    log = getattr(_runner, "_perp_close_log", None)
+                    if isinstance(log, list):
+                        log.append({
+                            "ticker": result.get("ticker"),
+                            "side": result.get("side"),
+                            "reason": f"MANUAL_CLOSE by {info['username']}",
+                            "size_usd": result.get("size_usd"),
+                            "pnl_usd": 0.0,
+                            "ts": int(time.time()),
+                            "order_id": result.get("order_id", ""),
+                        })
+                        del log[:-50]
+                except Exception:
+                    pass
+                print(f"[LIVE_SERVER] MANUAL CLOSE {result.get('ticker')} "
+                      f"by {info['username']} → {result.get('order_id')}")
+            self._send_json(200 if result.get("ok") else 400, result)
         elif u.path == "/api/okx/connect":
             # OKX API modal: persist credentials → rebuild executor → refresh DeskRunner
+            # This rewrites the SERVER's own credentials, so it is restricted to
+            # an admin session (or a loopback caller for local development).
             try:
+                _remote = (self.client_address or ("", 0))[0]
+                _is_local = _remote in ("127.0.0.1", "::1", "localhost")
+                if not _is_local:
+                    tok = self._get_token(u)
+                    info = _runner.db.validate_session(tok) if (_runner and tok) else None
+                    if not info or info.get("role") != "admin":
+                        self._send_json(403, {"ok": False, "error": "admin_only",
+                                              "msg": "Only an administrator can change the server OKX credentials"})
+                        return
                 new_key = data.get("api_key") or os.environ.get("OKX_API_KEY")
                 new_secret = data.get("api_secret") or os.environ.get("OKX_API_SECRET")
                 new_pass = data.get("passphrase") or os.environ.get("OKX_PASSPHRASE")
@@ -4004,24 +5212,76 @@ class LiveHandler(BaseHTTPRequestHandler):
             if not auth_info:
                 self._send_json(401, {"ok": False, "error": "unauthorized"})
                 return
-            stats = _runner.db.get_stats()
+            stats = _runner.db.get_stats(user_id=auth_info["user_id"])
             _runner.db.update_leaderboard(auth_info["user_id"], stats["total_pnl"], stats["total"], stats["profit_rate"])
             self._send_json(200, {"ok": True, "stats": stats})
         elif u.path == "/api/user/settings":
             if _runner is None or not hasattr(_runner, "db"):
                 self._send_json(503, {"error": "no runner db"})
                 return
-            tok = self._get_cookie_token()
+            tok = self._get_token(u)
             info = _runner.db.validate_session(tok) if tok else None
             if not info:
                 self._send_json(401, {"ok": False, "error": "unauthorized"})
                 return
-            # Filter allowed keys
-            allowed_keys = ["api_key","api_secret","api_passphrase","risk_preference","trade_mode",
-                            "run_start_time","run_end_time","max_position_usd","allowed_tickers",
-                            "take_profit_pct","stop_loss_pct"]
-            clean = {k: data.get(k, "") for k in allowed_keys}
+
+            # ── Partial update: merge into the stored row instead of wiping
+            # fields the caller did not send (saving API keys used to reset
+            # every trade setting back to empty).
+            existing = _runner.db.get_user_settings(info["user_id"]) or {}
+            clean = {c: existing.get(c, TradeDB.USER_SETTINGS_DEFAULTS.get(c))
+                     for c in TradeDB.USER_SETTINGS_COLUMNS}
+            for c in TradeDB.USER_SETTINGS_COLUMNS:
+                if c in data and data[c] is not None:
+                    clean[c] = data[c]
+
+            def _num(key, default, lo=None, hi=None):
+                try:
+                    v = float(clean.get(key) if clean.get(key) not in (None, "") else default)
+                except (TypeError, ValueError):
+                    raise ValueError(f"{key} must be a number")
+                if lo is not None:
+                    v = max(v, lo)
+                if hi is not None:
+                    v = min(v, hi)
+                return v
+
+            try:
+                clean["min_trade_usd"] = _num("min_trade_usd", 10.0, 0.0, 1e7)
+                clean["max_trade_usd"] = _num("max_trade_usd", 100.0, 0.0, 1e7)
+                if clean["max_trade_usd"] <= 0:
+                    clean["max_trade_usd"] = 100.0
+                if clean["min_trade_usd"] > clean["max_trade_usd"]:
+                    self._send_json(400, {
+                        "ok": False,
+                        "error": "min_greater_than_max",
+                        "msg": "min_trade_usd must not exceed max_trade_usd",
+                    })
+                    return
+                # The perp engine keys off max_position_usd — keep it aligned so
+                # the band is enforced on the live path too.
+                clean["max_position_usd"] = clean["max_trade_usd"]
+                clean["take_profit_pct"] = _num("take_profit_pct", 3.0, 0.1, 100)
+                clean["stop_loss_pct"] = _num("stop_loss_pct", 1.5, 0.1, 100)
+            except ValueError as ve:
+                self._send_json(400, {"ok": False, "error": "invalid_value",
+                                      "msg": str(ve)})
+                return
+
             result = _runner.db.upsert_user_settings(info["user_id"], clean)
+            result["settings"] = _runner.db.get_user_settings(info["user_id"])
+
+            # Credentials supplied → warm this member's snapshot right away so
+            # the dashboard switches over without waiting for the next cycle.
+            if _account_mgr is not None and any(
+                str(clean.get(k) or "").strip()
+                for k in ("api_key", "api_secret", "api_passphrase")
+            ) and _account_mgr.has_keys(info["user_id"], clean):
+                _account_mgr.request_refresh(info["user_id"])
+                threading.Thread(
+                    target=_account_mgr.force_refresh,
+                    args=(info["user_id"], clean), daemon=True,
+                ).start()
             self._send_json(200, result)
         elif u.path == "/api/admin/leaderboard/reset":
             if _runner is None or not hasattr(_runner, "db"):
@@ -4132,10 +5392,10 @@ def main(host: str = "127.0.0.1", port: int = 8765, csv_path: str | None = None,
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
 
-    # Ensure proxy env for external API calls (DexScreener, Jupiter)
+    # Default: no proxy (direct connect) — works for both:
+    #   - Local dev: user can set HTTP_PROXY/HTTPS_PROXY in OS env or .env
+    #   - Production: Alibaba Cloud VPS typically reaches OKX directly
     os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
-    os.environ.setdefault("HTTP_PROXY", "http://127.0.0.1:7897")
-    os.environ.setdefault("HTTPS_PROXY", "http://127.0.0.1:7897")
 
     fee_wallet = os.environ.get("RH_FEE_WALLET", "")
     user_wallet = os.environ.get("RH_USER_WALLET", "")
@@ -4220,6 +5480,26 @@ def main(host: str = "127.0.0.1", port: int = 8765, csv_path: str | None = None,
     else:
         print("[LIVE_SERVER] --no-live-runner: manual signal mode only")
 
+    # ── Per-member OKX account contexts ───────────────────────────────
+    # Members that saved their own API key get their own balance/positions on
+    # the dashboard; a background worker keeps those snapshots warm so the
+    # HTTP path never blocks on OKX.
+    global _account_mgr
+    if runner is not None and hasattr(runner, "db"):
+        acct_refresh = float(os.environ.get("USER_ACCOUNT_REFRESH_SEC", "30"))
+        demo_flag = bool(getattr(ex, "demo", False))
+        _account_mgr = UserAccountManager(
+            runner.db,
+            refresh_sec=acct_refresh,
+            demo=demo_flag,
+            builder_code=os.environ.get("OKX_AI_BUILDER_CODE", ""),
+        )
+        _account_mgr.start()
+        print(f"[LIVE_SERVER] member account contexts ON "
+              f"(refresh={acct_refresh:.0f}s, demo={demo_flag})")
+    else:
+        print("[LIVE_SERVER] member account contexts OFF (no runner db)")
+
     srv = ThreadingHTTPServer((host, port), LiveHandler)
     print(f"[LIVE_SERVER] Dashboard: http://{host}:{port}")
     print(f"[LIVE_SERVER] API:       http://{host}:{port}/api/status")
@@ -4228,6 +5508,8 @@ def main(host: str = "127.0.0.1", port: int = 8765, csv_path: str | None = None,
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n[LIVE_SERVER] stopping...")
+        if _account_mgr is not None:
+            _account_mgr.stop()
         if runner:
             runner.stop()
         srv.shutdown()

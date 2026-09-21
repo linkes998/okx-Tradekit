@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -94,13 +95,42 @@ def _get_proxies() -> dict | None:
     return None
 
 
+# ── Connection reuse ─────────────────────────────────────────────────
+# Every call used to go through `requests.get/post`, opening a fresh
+# TCP+TLS connection each time. With one account snapshot per member every
+# 30s — three calls each — the TLS handshake dominated the cost. A pooled
+# Session keeps the connection alive and reuses it.
+#
+# The Session is thread-local because requests.Session is not fully
+# thread-safe and this module is called from several server threads.
+_SESSION_LOCAL = threading.local()
+
+
+def _get_session() -> requests.Session:
+    """Return this thread's pooled HTTP session."""
+    sess = getattr(_SESSION_LOCAL, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=8,
+            pool_maxsize=16,
+            max_retries=0,          # retry policy lives in _post_with_backoff
+            pool_block=False,
+        )
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
+        _SESSION_LOCAL.session = sess
+    return sess
+
+
 def _http_get(url, params=None, headers=None, timeout=10.0):
     proxies = _get_proxies()
     hdrs = {"Accept": "application/json", "User-Agent": "RH-OKX-Executor/1.0"}
     if headers:
         hdrs.update(headers)
     try:
-        r = requests.get(url, params=params, headers=hdrs, proxies=proxies, timeout=timeout)
+        r = _get_session().get(url, params=params, headers=hdrs,
+                               proxies=proxies, timeout=timeout)
         if r.status_code >= 400:
             raise RuntimeError(f"HTTP {r.status_code} GET {url.split('?')[0]}: {r.text[:400]}")
         return r.json()
@@ -114,7 +144,8 @@ def _http_post(url, payload, headers=None, timeout=15.0):
     if headers:
         hdrs.update(headers)
     try:
-        r = requests.post(url, json=payload, headers=hdrs, proxies=proxies, timeout=timeout)
+        r = _get_session().post(url, json=payload, headers=hdrs,
+                                proxies=proxies, timeout=timeout)
         if r.status_code >= 400:
             raise RuntimeError(f"HTTP {r.status_code} POST {url}: {r.text[:500]}")
         return r.json()

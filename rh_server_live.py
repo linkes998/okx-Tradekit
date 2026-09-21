@@ -932,9 +932,9 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
       <div class="panel with-pad">
         <div class="panel-header"><div class="panel-title"><span class="dot amber"></span> <span data-i18n="pt_autoclose">Auto-Close Rules Configuration</span></div><span class="panel-action" onclick="openPerpSettings()" data-i18n="btn_configure">Configure →</span></div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;padding:8px 0">
-          <div style="background:var(--surface2);padding:12px;border-radius:4px"><div style="font-size:9px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em;margin-bottom:4px" data-i18n="pr_tp">Take Profit</div><div style="font-family:var(--mono);font-size:18px;color:var(--green)" id="perp-rule-tp">3.0%</div><div style="font-size:9px;color:var(--text-dim);margin-top:2px" data-i18n="pr_tp_desc">Auto-close on profit</div></div>
-          <div style="background:var(--surface2);padding:12px;border-radius:4px"><div style="font-size:9px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em;margin-bottom:4px" data-i18n="pr_sl">Stop Loss</div><div style="font-family:var(--mono);font-size:18px;color:var(--red)" id="perp-rule-sl">1.5%</div><div style="font-size:9px;color:var(--text-dim);margin-top:2px" data-i18n="pr_sl_desc">Auto-close on loss</div></div>
-          <div style="background:var(--surface2);padding:12px;border-radius:4px"><div style="font-size:9px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em;margin-bottom:4px" data-i18n="pr_hold">Max Hold Time</div><div style="font-family:var(--mono);font-size:18px;color:var(--amber)" id="perp-rule-hold">30 min</div><div style="font-size:9px;color:var(--text-dim);margin-top:2px" data-i18n="pr_hold_desc">Force close after</div></div>
+          <div style="background:var(--surface2);padding:12px;border-radius:4px"><div style="font-size:9px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em;margin-bottom:4px" data-i18n="pr_tp">Take Profit</div><div style="font-family:var(--mono);font-size:18px;color:var(--green)" id="perp-rule-tp">6%</div><div style="font-size:9px;color:var(--text-dim);margin-top:2px" data-i18n="pr_tp_desc">Auto-close on profit</div></div>
+          <div style="background:var(--surface2);padding:12px;border-radius:4px"><div style="font-size:9px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em;margin-bottom:4px" data-i18n="pr_sl">Stop Loss</div><div style="font-family:var(--mono);font-size:18px;color:var(--red)" id="perp-rule-sl">1%</div><div style="font-size:9px;color:var(--text-dim);margin-top:2px" data-i18n="pr_sl_desc">Auto-close on loss</div></div>
+          <div style="background:var(--surface2);padding:12px;border-radius:4px"><div style="font-size:9px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em;margin-bottom:4px" data-i18n="pr_hold">Max Hold Time</div><div style="font-family:var(--mono);font-size:18px;color:var(--amber)" id="perp-rule-hold">12h</div><div style="font-size:9px;color:var(--text-dim);margin-top:2px" data-i18n="pr_hold_desc">Force close after</div></div>
           <div style="background:var(--surface2);padding:12px;border-radius:4px"><div style="font-size:9px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em;margin-bottom:4px" data-i18n="pr_status">Status</div><div style="font-family:var(--mono);font-size:18px;color:var(--green)" data-i18n="pr_active">ACTIVE</div><div style="font-size:9px;color:var(--text-dim);margin-top:2px" data-i18n="pr_status_desc">Auto-close enabled</div></div>
         </div>
       </div>
@@ -2571,8 +2571,10 @@ function applyDeskState(s){
   // OKX round trips and the legacy DB ledger depending on mode).
   const tradesPageEl = document.getElementById('page-trades');
   if(tradesPageEl && tradesPageEl.classList.contains('active')) loadTradesPage();
-  const perpPageEl = document.getElementById('page-perp');
-  if(perpPageEl && perpPageEl.classList.contains('active')) syncPerpRuleSummary(s.perp_config);
+  // Keep the auto-close rule readout honest on every poll, whichever page is
+  // open — it is four textContent writes, and a stale hardcoded rule line in
+  // the header was exactly the contradiction this replaced.
+  syncPerpRuleSummary(s.perp_config);
   drawEquity();
 }
 let _pollTimer=null;

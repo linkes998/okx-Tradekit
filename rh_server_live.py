@@ -920,7 +920,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
         <div class="metric-card"><div class="metric-label" data-i18n="ml_perp_equity">Perp Equity</div><div class="metric-value" id="okx-perp-equity">—</div></div>
         <div class="metric-card"><div class="metric-label" data-i18n="ml_open_upl">Open UPL</div><div class="metric-value" id="okx-perp-upl">—</div></div>
         <div class="metric-card"><div class="metric-label" data-i18n="ml_open_positions">Open Positions</div><div class="metric-value" id="okx-perp-positions-count">—</div></div>
-        <div class="metric-card"><div class="metric-label" data-i18n="ml_autoclose_rules">Auto-Close Rules</div><div class="metric-value" style="font-size:12px">TP 3% / SL 1.5% / 30min</div></div>
+        <div class="metric-card"><div class="metric-label" data-i18n="ml_autoclose_rules">Auto-Close Rules</div><div class="metric-value" style="font-size:12px" id="perp-rule-summary">—</div></div>
       </div>
       <div class="panel with-pad">
         <div class="panel-header"><div class="panel-title"><span class="dot" style="background:var(--purple);box-shadow:0 0 6px var(--purple)"></span> <span data-i18n="pt_live_perp">Live Perp Positions</span></div></div>
@@ -1246,19 +1246,19 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
         <div style="display:flex;flex-direction:column;gap:12px">
           <div>
             <label style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em" data-i18n="pm_tp">Take Profit Threshold (%)</label>
-            <input id="perp-tp" type="number" step="0.1" value="3" data-default="3" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 10px;font-family:var(--mono);border-radius:2px;margin-top:4px;font-size:13px">
+            <input id="perp-tp" type="number" step="0.1" value="6" data-default="6" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 10px;font-family:var(--mono);border-radius:2px;margin-top:4px;font-size:13px">
           </div>
           <div>
             <label style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em" data-i18n="pm_sl">Stop Loss Threshold (%)</label>
-            <input id="perp-sl" type="number" step="0.1" value="1.5" data-default="1.5" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 10px;font-family:var(--mono);border-radius:2px;margin-top:4px;font-size:13px">
+            <input id="perp-sl" type="number" step="0.1" value="1" data-default="1" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 10px;font-family:var(--mono);border-radius:2px;margin-top:4px;font-size:13px">
           </div>
           <div>
             <label style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em" data-i18n="pm_hold">Max Hold Time (seconds)</label>
-            <input id="perp-max-hold" type="number" value="1800" data-default="1800" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 10px;font-family:var(--mono);border-radius:2px;margin-top:4px;font-size:13px">
+            <input id="perp-max-hold" type="number" value="43200" data-default="43200" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 10px;font-family:var(--mono);border-radius:2px;margin-top:4px;font-size:13px">
           </div>
           <div>
             <label style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em" data-i18n="pm_maxsize">Max Position Size (USD)</label>
-            <input id="perp-max-size" type="number" value="1000" data-default="1000" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 10px;font-family:var(--mono);border-radius:2px;margin-top:4px;font-size:13px">
+            <input id="perp-max-size" type="number" value="25000" data-default="25000" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 10px;font-family:var(--mono);border-radius:2px;margin-top:4px;font-size:13px">
           </div>
           <div style="display:flex;align-items:center;gap:10px;padding:8px 0">
             <input id="perp-reopen" type="checkbox" checked data-default="true" style="width:16px;height:16px;cursor:pointer">
@@ -2571,6 +2571,8 @@ function applyDeskState(s){
   // OKX round trips and the legacy DB ledger depending on mode).
   const tradesPageEl = document.getElementById('page-trades');
   if(tradesPageEl && tradesPageEl.classList.contains('active')) loadTradesPage();
+  const perpPageEl = document.getElementById('page-perp');
+  if(perpPageEl && perpPageEl.classList.contains('active')) syncPerpRuleSummary(s.perp_config);
   drawEquity();
 }
 let _pollTimer=null;
@@ -3548,6 +3550,27 @@ function loadSpotPage(){
 // ═══════════════════════════════════════════════════
 // PERP ENGINE PAGE
 // ═══════════════════════════════════════════════════
+function fmtHold(sec){
+  sec = Math.max(0, Math.round(Number(sec)||0));
+  if(sec >= 3600) return (sec%3600===0 ? (sec/3600) : (sec/3600).toFixed(1))+'h';
+  if(sec >= 60) return Math.round(sec/60)+' min';
+  return sec+'s';
+}
+function syncPerpRuleSummary(cfg){
+  cfg = cfg || {};
+  const tp = cfg.tp_pct!==undefined && cfg.tp_pct!==null ? cfg.tp_pct : 6;
+  const sl = cfg.sl_pct!==undefined && cfg.sl_pct!==null ? cfg.sl_pct : 1;
+  const hold = cfg.max_hold_sec!==undefined && cfg.max_hold_sec!==null ? cfg.max_hold_sec : 43200;
+  const tpEl = document.getElementById('perp-rule-tp');
+  const slEl = document.getElementById('perp-rule-sl');
+  const holdEl = document.getElementById('perp-rule-hold');
+  const sumEl = document.getElementById('perp-rule-summary');
+  if(tpEl) tpEl.textContent = tp+'%';
+  if(slEl) slEl.textContent = sl+'%';
+  if(holdEl) holdEl.textContent = fmtHold(hold);
+  // Exactly what the engine enforces — never a hardcoded copy.
+  if(sumEl) sumEl.textContent = 'TP '+tp+'% / SL '+sl+'% / '+fmtHold(hold);
+}
 function loadPerpPage(){
   window.__perp_loaded = true;
   const s = window.__lastDeskState || {};
@@ -3564,13 +3587,7 @@ function loadPerpPage(){
   }
   if(countEl) countEl.textContent = perpPositions.length;
   // Update auto-close rules display from state
-  const cfg = s.perp_config || {};
-  const tpEl = document.getElementById('perp-rule-tp');
-  const slEl = document.getElementById('perp-rule-sl');
-  const holdEl = document.getElementById('perp-rule-hold');
-  if(tpEl) tpEl.textContent = (cfg.tp_pct||3)+'%';
-  if(slEl) slEl.textContent = (cfg.sl_pct||1.5)+'%';
-  if(holdEl) holdEl.textContent = ((cfg.max_hold_sec||1800)/60).toFixed(0)+' min';
+  syncPerpRuleSummary(s.perp_config);
   const body = document.getElementById('okx-perp-body');
   if(body){
     if(!perpPositions.length){ body.innerHTML='<tr><td colspan="10" class="empty-row">— no perp positions —</td></tr>'; }
@@ -3773,10 +3790,10 @@ function closePerpSettings(){
 }
 function savePerpSettings(){
   const vals = {
-    tp_pct: document.getElementById('perp-tp')?.value || '3',
-    sl_pct: document.getElementById('perp-sl')?.value || '1.5',
-    max_hold_sec: document.getElementById('perp-max-hold')?.value || '1800',
-    max_position_usd: document.getElementById('perp-max-size')?.value || '1000',
+    tp_pct: document.getElementById('perp-tp')?.value || '6',
+    sl_pct: document.getElementById('perp-sl')?.value || '1',
+    max_hold_sec: document.getElementById('perp-max-hold')?.value || '43200',
+    max_position_usd: document.getElementById('perp-max-size')?.value || '25000',
     allow_reopen: document.getElementById('perp-reopen')?.checked ? 'true' : 'false',
   };
   fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({method:'save',settings:vals})})

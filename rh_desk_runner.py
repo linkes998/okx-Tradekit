@@ -13,6 +13,30 @@ from rh_trencher import Desk, Fill, TokenLaunch
 from db_trades import TradeDB
 
 
+def okx_position_open_seconds(pos: dict) -> int:
+    """Position open time from an OKX ``/account/positions`` payload, UNIX seconds.
+
+    OKX reports ``cTime`` (position created) and ``uTime`` (last adjusted) as
+    MILLISECOND values. The original code read a ``cups`` key, which OKX never
+    returns, so ``entry_time`` stayed 0 for every position and the max-hold time
+    stop could never arm. 0 means "unknown" and makes the caller skip the time
+    stop rather than guess.
+    """
+    for key in ("cTime", "uTime", "pTime", "ts"):
+        raw = pos.get(key)
+        if not raw:
+            continue
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if val > 1e11:              # milliseconds -> seconds
+            val /= 1000.0
+        if val > 0:
+            return int(val)
+    return 0
+
+
 class DeskRunner:
     """后台线程驱动 Desk tick loop.
 
@@ -55,7 +79,10 @@ class DeskRunner:
         # ── OKX PERP AUTO-EXIT CONFIG ──
         self._perp_tp_pct: float = float(os.environ.get("OKX_PERP_TP_PCT", "3.0"))
         self._perp_sl_pct: float = float(os.environ.get("OKX_PERP_SL_PCT", "1.5"))
-        self._perp_max_hold_sec: int = int(os.environ.get("OKX_PERP_MAX_HOLD_SEC", "1800"))
+        # Time stop: a position held longer than this is force-closed. Default
+        # 12h — at 30 minutes the clock, not the edge, was deciding exits long
+        # before a +6% take-profit target could realistically be reached.
+        self._perp_max_hold_sec: int = int(os.environ.get("OKX_PERP_MAX_HOLD_SEC", "43200"))
         self._perp_last_exit: dict[str, float] = {}     # ticker → timestamp of last exit
         self._perp_close_log: list[dict] = []           # recent closes for UI display
         self._perp_allow_reopen: bool = True             # default: allow re-entry
@@ -383,6 +410,8 @@ class DeskRunner:
                     "last_px": last_px,
                     "upl": round(upl, 2),
                     "lever": pos.get("lever", "?"),
+                    # Real exchange open time — drives the max-hold time stop.
+                    "entry_time": okx_position_open_seconds(pos),
                 })
             perp.sort(key=lambda x: abs(x["size_usd"]), reverse=True)
             self._okx_cached_positions = perp
@@ -767,10 +796,13 @@ class DeskRunner:
                 reason = f"TAKE_PROFIT +{pct_change:.1f}%"
             elif pct_change <= -self._perp_sl_pct:
                 reason = f"STOP_LOSS {pct_change:.1f}%"
-            # Also check time limit
-            entry_time = pos.get("entry_time", 0)
-            if entry_time > 0 and (now - entry_time) > self._perp_max_hold_sec:
-                reason = f"MAX_HOLD_EXCEEDED ({(now - entry_time)/60:.0f}min)"
+            # Time stop — only when no TP/SL already fired (an in-profit trade must
+            # not be force-closed by the clock) and only with a plausible open time,
+            # so a missing or garbage timestamp can never mass-close positions.
+            entry_time = pos.get("entry_time", 0) or 0
+            age = now - entry_time if entry_time else 0
+            if reason is None and 0 < age <= 7 * 86400 and age > self._perp_max_hold_sec:
+                reason = f"MAX_HOLD_EXCEEDED ({age/60:.0f}min)"
             if reason:
                 close_side = "sell" if side == "LONG" else "buy"
                 to_close.append((ticker, close_side, size_usd, reason, upl))

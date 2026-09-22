@@ -38,9 +38,23 @@ except ImportError:  # pragma: no cover - OKX is optional at import time
     TD_MODE_SPOT = "cross"
 
 try:
-    from db_trades import DEFAULT_TRADE_USD
+    from db_trades import (
+        DEFAULT_TRADE_USD, DEFAULT_RISK, DEFAULT_MAX_HOLD_SEC, risk_profile,
+    )
 except ImportError:  # pragma: no cover - keeps this module importable alone
     DEFAULT_TRADE_USD = 50.0
+    DEFAULT_RISK = "balanced"
+    DEFAULT_MAX_HOLD_SEC = 43200
+
+    _FALLBACK_PROFILES = {
+        "conservative": {"max_pct": 0.02, "total_pct": 0.05, "k_sl": 1.2, "r": 3.5, "max_pos": 2},
+        "aggressive": {"max_pct": 0.06, "total_pct": 0.12, "k_sl": 2.0, "r": 2.5, "max_pos": 5},
+    }
+    _FALLBACK_BALANCED = {"max_pct": 0.04, "total_pct": 0.08, "k_sl": 1.5, "r": 3.0, "max_pos": 3}
+
+    def risk_profile(pref):  # type: ignore[misc]
+        return _FALLBACK_PROFILES.get(
+            str(pref or DEFAULT_RISK).strip().lower(), _FALLBACK_BALANCED)
 
 
 def _f(v: Any, default: float = 0.0) -> float:
@@ -612,6 +626,28 @@ def in_run_window(start: str | None, end: str | None, now: float | None = None) 
     return mins >= lo or mins <= hi
 
 
+def okx_position_open_seconds(pos: dict) -> int:
+    """Position open time from an OKX ``/account/positions`` row, UNIX seconds.
+
+    OKX reports ``cTime`` (created) / ``uTime`` (last adjusted) in MILLISECONDS;
+    there is no ``cups`` key. ``0`` means unknown and makes the caller skip the
+    time stop rather than guess.
+    """
+    for key in ("cTime", "uTime", "pTime", "ts"):
+        raw = pos.get(key)
+        if not raw:
+            continue
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if val > 1e11:              # milliseconds -> seconds
+            val /= 1000.0
+        if val > 0:
+            return int(val)
+    return 0
+
+
 class MemberTrader:
     """Auto-trades each opted-in member's OWN OKX account by their OWN rules.
 
@@ -658,7 +694,20 @@ class MemberTrader:
         self._interval = float(interval if interval is not None
                                else os.environ.get("OKX_MEMBER_TRADE_INTERVAL_SEC", "60"))
         self._interval = max(10.0, self._interval)
-        self._max_positions = int(os.environ.get("OKX_MEMBER_MAX_POSITIONS", "3"))
+        # Max concurrent positions: env pins it, otherwise the risk profile decides.
+        _mp_env = os.environ.get("OKX_MEMBER_MAX_POSITIONS")
+        self._max_positions_env: int | None = int(_mp_env) if _mp_env else None
+        self._max_positions: int = self._max_positions_env or int(
+            risk_profile(DEFAULT_RISK)["max_pos"])
+        # ── ATR-adaptive SL/TP bounds (mirror the system desk) ──
+        self._atr_sl_floor = float(os.environ.get("OKX_ATR_SL_FLOOR", "0.8"))
+        self._atr_sl_cap = float(os.environ.get("OKX_ATR_SL_CAP", "4.0"))
+        self._atr_tp_floor = float(os.environ.get("OKX_ATR_TP_FLOOR", "2.0"))
+        self._atr_tp_cap = float(os.environ.get("OKX_ATR_TP_CAP", "12.0"))
+        self._atr_use_min = float(os.environ.get("OKX_ATR_USE_MIN", "0.05"))
+        # Fallback holding time when the member never set one (12h, same as desk).
+        self._member_max_hold_sec = int(os.environ.get(
+            "OKX_MEMBER_MAX_HOLD_SEC", str(int(DEFAULT_MAX_HOLD_SEC))))
         self._entry_cooldown = float(os.environ.get("OKX_MEMBER_ENTRY_COOLDOWN_SEC", "300"))
         self._close_cooldown = float(os.environ.get("OKX_MEMBER_CLOSE_COOLDOWN_SEC", "90"))
         self._leverage = int(os.environ.get("OKX_PERP_LEVERAGE", "5"))
@@ -747,7 +796,7 @@ class MemberTrader:
         if not in_run_window(m.get("run_start_time"), m.get("run_end_time")):
             return False
         held = {p["ticker"].upper() for p in positions}
-        self._scan_entries(uid, m, exe, held)
+        self._scan_entries(uid, m, exe, held, positions)
         return True
 
     # ── helpers ────────────────────────────────────────────────────────────
@@ -774,6 +823,9 @@ class MemberTrader:
                 "last_px": last_px,
                 "upl": round(_f(pos.get("upl")), 2),
                 "pos_side": pos.get("posSide", "net"),
+                # Drives the member time stop; 0 = unknown → skip the time stop.
+                "open_time": okx_position_open_seconds(pos),
+                "size_usd": round(abs(size) * last_px, 2),
             })
         return out
 
@@ -784,10 +836,43 @@ class MemberTrader:
         tp = abs(_f(settings.get("take_profit_pct"), 3.0)) or 3.0
         return max(0.1, sl), max(0.1, tp)
 
+    def _sl_tp_for(self, settings: dict, atr_pct: float | None) -> tuple[float, float]:
+        """ATR-adaptive SL/TP, scaled by the member's risk preference.
+
+        A fixed 50/10 style pair does not survive noisy coins, so the adaptive
+        path is primary; the member's saved pair is only the fallback for when
+        the ATR is unknown.
+        """
+        a = _f(atr_pct)
+        if a < self._atr_use_min:
+            return self._default_sl_tp(settings)
+        prof = risk_profile(settings.get("risk_preference"))
+        sl = min(max(_f(prof["k_sl"]) * a, self._atr_sl_floor), self._atr_sl_cap)
+        tp = min(max(_f(prof["r"]) * sl, self._atr_tp_floor), self._atr_tp_cap)
+        return round(sl, 4), round(tp, 4)
+
+    def _equity_for(self, uid: int, exe) -> float:
+        """Member account equity — prefers the manager's cached snapshot."""
+        bal: dict = {}
+        try:
+            snap = self._mgr.snapshot(uid)
+            bal = ((snap or {}).get("balance") or {})
+        except Exception:
+            bal = {}
+        eq = _f(bal.get("total_eq_usd"))
+        if eq <= 0:
+            try:
+                eq = _f(exe.get_account_summary().get("total_eq_usd"))
+            except Exception:
+                eq = 0.0
+        return max(0.0, eq)
+
     # ── exits ──────────────────────────────────────────────────────────────
 
     def _manage_closes(self, uid: int, m: dict, exe, positions: list[dict]) -> None:
         now = time.time()
+        # Per-member holding limit; falls back to 12h, same as the system desk.
+        max_hold = int(_f(m.get("max_hold_sec")) or self._member_max_hold_sec)
         changed = False
         for p in positions:
             avg_px, last_px = p["avg_px"], p["last_px"]
@@ -798,12 +883,19 @@ class MemberTrader:
                 continue
             pct = ((last_px - avg_px) if p["side"] == "LONG"
                    else (avg_px - last_px)) / avg_px * 100
-            sl, tp = self._sl_tp.get((uid, p["inst_id"])) or self._default_sl_tp(m)
+            sl, tp = self._sl_tp.get((uid, p["inst_id"])) or self._sl_tp_for(m, None)
             reason = None
             if pct >= tp:
                 reason = f"TAKE_PROFIT +{pct:.1f}% (TP {tp:.2f}%)"
             elif pct <= -sl:
                 reason = f"STOP_LOSS {pct:.1f}% (SL {sl:.2f}%)"
+            # ── time stop: never let a member position ride forever ──
+            if reason is None:
+                opened = int(p.get("open_time") or 0)
+                if opened > 0:
+                    age = now - opened
+                    if 0 < age <= 7 * 86400 and age > max_hold:
+                        reason = f"MAX_HOLD_EXCEEDED ({age / 60:.0f}min)"
             if reason is None:
                 continue
             qty = abs(p["size"])
@@ -848,18 +940,37 @@ class MemberTrader:
 
     # ── entries ────────────────────────────────────────────────────────────
 
-    def _scan_entries(self, uid: int, m: dict, exe, held: set[str]) -> None:
-        if len(held) >= self._max_positions:
+    def _scan_entries(self, uid: int, m: dict, exe, held: set[str],
+                      positions: list[dict]) -> None:
+        prof = risk_profile(m.get("risk_preference"))
+        max_pos = self._max_positions_env or int(prof["max_pos"])
+        if len(held) >= max_pos:
             return
         allowed = {t.strip().upper() for t in
                    str(m.get("allowed_tickers") or "").split(",") if t.strip()}
         now = time.time()
         # Same resolver the settings UI/user_account use — one source of truth.
         size = UserAccountManager.resolve_trade_usd(m, fallback=self._default_trade_usd)
+        # ── Risk-preference gates (the preference now drives real limits) ──
+        equity = self._equity_for(uid, exe)
+        exposure = sum(abs(_f(p.get("size_usd"))) for p in positions or [])
+        if equity > 0:
+            entry_cap = equity * _f(prof["max_pct"])
+            if entry_cap < OKX_MIN_ORDER_USD:
+                print(f"[MemberTrader] user {uid} SKIP: risk "
+                      f"{m.get('risk_preference')} caps an entry at "
+                      f"${entry_cap:.2f} (< OKX min ${OKX_MIN_ORDER_USD:.0f})")
+                return
+            size = min(size, entry_cap)
         if size < OKX_MIN_ORDER_USD:
             return
+        if equity > 0 and exposure + size > equity * _f(prof["total_pct"]):
+            print(f"[MemberTrader] user {uid} SKIP: exposure "
+                  f"${exposure + size:.2f} exceeds {_f(prof['total_pct']):.0%} of "
+                  f"equity ${equity:.2f} (risk={m.get('risk_preference')})")
+            return
         for sig in self._signals():
-            if len(held) >= self._max_positions:
+            if len(held) >= max_pos:
                 break
             ticker = str(sig.get("ticker") or "").upper()
             if not ticker or ticker in held:
@@ -898,7 +1009,7 @@ class MemberTrader:
                 print(f"[MemberTrader] user {uid} ENTRY {ticker} rejected: "
                       f"{res.get('msg') or res}")
                 continue
-            sl, tp = self._default_sl_tp(m)
+            sl, tp = self._sl_tp_for(m, sig.get("atr_pct"))
             self._sl_tp[(uid, inst_id)] = (sl, tp)
             held.add(ticker)
             self._orders += 1

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 import numpy as np
 from rh_trencher import Desk, Fill, TokenLaunch
-from db_trades import TradeDB, DEFAULT_TRADE_USD
+from db_trades import TradeDB, DEFAULT_TRADE_USD, DEFAULT_RISK, risk_profile
 
 
 def okx_position_open_seconds(pos: dict) -> int:
@@ -111,6 +111,12 @@ class DeskRunner:
         # _reload_perp_settings() from: ops DB settings.trade_usd → env
         # OKX_SPOT_ORDER_USD / OKX_PERP_ORDER_USD → DEFAULT_TRADE_USD (50).
         self._perp_trade_usd: float = float(DEFAULT_TRADE_USD)
+        # ── RISK PREFERENCE (now drives real numbers, not just a label) ──
+        self._risk_preference: str = DEFAULT_RISK
+        _rp = risk_profile(DEFAULT_RISK)
+        self._risk_max_pct: float = _rp["max_pct"]       # max notional per entry / equity
+        self._risk_total_pct: float = _rp["total_pct"]   # max total open exposure / equity
+        self._risk_max_pos: int = int(_rp["max_pos"])    # max concurrent positions
         # inst_id → (sl_pct, tp_pct) / atr%：开仓时冻结，平仓时按 inst_id 取用
         self._perp_sl_tp: dict[str, tuple[float, float]] = {}
         self._perp_atr: dict[str, float] = {}
@@ -803,11 +809,31 @@ class DeskRunner:
         if submitted_count > 0:
             print(f"[DeskRunner] Auto-submit batch: {submitted_count}/{len(pending_keys)} swaps submitted")
 
-    def _reload_perp_settings(self) -> None:
-        """Reload perp auto-close settings from DB, falling back to env vars.
+    @staticmethod
+    def _pick_num(*candidates, default: float) -> float:
+        """First usable value wins: **ops DB row > env > code default**.
 
-        Priority: OKX_PERP_MAX_POSITION_USD env > DB max_position_usd > 1000 default.
-        This lets operators pin a hard cap via .env without touching the UI.
+        The ops panel and .env are both operator surface, so every knob must use
+        the same order — otherwise saving one field in the modal silently does
+        nothing while its neighbour takes effect (the old max_position_usd /
+        trade_usd split had exactly that bug).
+        """
+        for c in candidates:
+            if c is None or str(c).strip() == "":
+                continue
+            try:
+                v = float(c)
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                return v
+        return float(default)
+
+    def _reload_perp_settings(self) -> None:
+        """Reload perp auto-close settings.
+
+        Unified priority for every knob: ops DB (settings modal) > env > code
+        default — so a value saved in the dashboard always wins over .env.
         """
         try:
             s = self.db.get_all_settings()
@@ -815,40 +841,51 @@ class DeskRunner:
             if "sl_pct" in s: self._perp_sl_pct = float(s["sl_pct"])
             if "max_hold_sec" in s: self._perp_max_hold_sec = int(s["max_hold_sec"])
             self._perp_allow_reopen = s.get("allow_reopen", "true") == "true"
-            # OKX_PERP_MAX_POSITION_USD env wins over DB
-            env_max = os.environ.get("OKX_PERP_MAX_POSITION_USD")
-            if env_max:
-                try:
-                    self._perp_max_position_usd = float(env_max)
-                    print(f"[DeskRunner] Using OKX_PERP_MAX_POSITION_USD env: ${self._perp_max_position_usd}")
-                except ValueError:
-                    self._perp_max_position_usd = float(s.get("max_position_usd", "1000"))
-            else:
-                self._perp_max_position_usd = float(s.get("max_position_usd", "1000"))
+            # ── Unified precedence: DB > env > default ──
+            self._perp_max_position_usd = self._pick_num(
+                s.get("max_position_usd"),
+                os.environ.get("OKX_PERP_MAX_POSITION_USD"),
+                default=1000.0)
             # Minimum notional for a single entry (0 = no floor beyond OKX's)
-            self._perp_min_trade_usd = float(s.get("min_trade_usd", "0") or 0)
-            # ── Per-trade auto-exec notional (single source of truth) ──
-            # ops DB 「trade_usd」 > env OKX_SPOT_ORDER_USD/OKX_PERP_ORDER_USD > $50
-            env_trade = (os.environ.get("OKX_SPOT_ORDER_USD")
-                         or os.environ.get("OKX_PERP_ORDER_USD") or "")
-            try:
-                self._perp_trade_usd = float(s.get("trade_usd") or env_trade)
-            except (TypeError, ValueError):
-                self._perp_trade_usd = float(DEFAULT_TRADE_USD)
-            if self._perp_trade_usd <= 0:
-                self._perp_trade_usd = float(DEFAULT_TRADE_USD)
+            self._perp_min_trade_usd = self._pick_num(
+                s.get("min_trade_usd"),
+                os.environ.get("OKX_PERP_MIN_TRADE_USD"),
+                default=0.0)
+            # Per-trade auto-exec notional (single source of truth)
+            self._perp_trade_usd = self._pick_num(
+                s.get("trade_usd"),
+                os.environ.get("OKX_SPOT_ORDER_USD"),
+                os.environ.get("OKX_PERP_ORDER_USD"),
+                default=float(DEFAULT_TRADE_USD))
+            # ── Risk preference now drives real numbers ──
+            self._risk_preference = str(s.get("risk_preference") or DEFAULT_RISK).lower()
+            prof = risk_profile(self._risk_preference)
+            self._risk_max_pct = prof["max_pct"]
+            self._risk_total_pct = prof["total_pct"]
+            self._risk_max_pos = int(prof["max_pos"])
+            self._atr_k_sl = self._pick_num(
+                s.get("atr_k_sl"), os.environ.get("OKX_ATR_K_SL"), default=prof["k_sl"])
+            self._atr_r = self._pick_num(
+                s.get("atr_r"), os.environ.get("OKX_ATR_R"), default=prof["r"])
             # Auto-trade mode from DB (default: signal_only)
             self._trade_mode = s.get("trade_mode", "signal_only")
             # P2: entry-signal source. "real" = OKX candles (trend/RSI/ATR/
             # breakout) via _scan_real_signals; "legacy" = the meme-era desk
-            # narrative path. env wins so operators can pin it in .env.
-            self._signal_mode = (os.environ.get("OKX_SIGNAL_MODE")
-                                 or s.get("signal_mode", "real")).lower()
+            # narrative path.
+            self._signal_mode = str(s.get("signal_mode")
+                                    or os.environ.get("OKX_SIGNAL_MODE")
+                                    or "real").lower()
             _adapt = (f"adaptive(k_sl={self._atr_k_sl},R={self._atr_r},"
                       f"sl=[{self._atr_sl_floor},{self._atr_sl_cap}]%,"
                       f"tp=[{self._atr_tp_floor},{self._atr_tp_cap}]%)"
                       if self._atr_adaptive else "fixed")
-            print(f"[DeskRunner] Perp settings reloaded: TP={self._perp_tp_pct}% SL={self._perp_sl_pct}% hold={self._perp_max_hold_sec}s reopen={self._perp_allow_reopen} size_band=${self._perp_min_trade_usd:.0f}-${self._perp_max_position_usd:.0f} trade_usd={self._perp_trade_usd} mode={self._trade_mode} signal_mode={self._signal_mode} sltp={_adapt}")
+            print(f"[DeskRunner] Perp settings reloaded: TP={self._perp_tp_pct}% SL={self._perp_sl_pct}% "
+                  f"hold={self._perp_max_hold_sec}s reopen={self._perp_allow_reopen} "
+                  f"size_band=${self._perp_min_trade_usd:.0f}-${self._perp_max_position_usd:.0f} "
+                  f"trade_usd={self._perp_trade_usd} mode={self._trade_mode} "
+                  f"signal_mode={self._signal_mode} sltp={_adapt} "
+                  f"risk={self._risk_preference}(max={self._risk_max_pct:.0%} "
+                  f"total={self._risk_total_pct:.0%} pos={self._risk_max_pos})")
         except Exception as e:
             print(f"[DeskRunner] WARNING — perp settings reload failed: {e}")
 
@@ -957,11 +994,36 @@ class DeskRunner:
             return
         self._perp_last_entry[ticker] = now
 
-        # ── Per-trade amount band (min_trade_usd … max_position_usd) ──
+        # ── Risk-preference exposure gates (preference now drives real limits) ──
+        def _to_f(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+
+        equity = _to_f((self._okx_cached_balance or {}).get("total_eq_usd"))
+        exposure = 0.0
+        for _p in self._okx_cached_positions or []:
+            exposure += abs(_to_f(_p.get("size_usd")))
+        if self._risk_max_pos > 0 and len(self._okx_cached_positions) >= self._risk_max_pos:
+            print(f"[DeskRunner] AUTO-EXEC SKIP {ticker}: max positions "
+                  f"{self._risk_max_pos} reached (risk={self._risk_preference})")
+            return
+        if equity > 0 and self._risk_total_pct > 0 \
+                and exposure + stake_usd > equity * self._risk_total_pct:
+            print(f"[DeskRunner] AUTO-EXEC SKIP {ticker}: exposure "
+                  f"${exposure + stake_usd:.2f} would exceed "
+                  f"{self._risk_total_pct:.0%} of equity ${equity:.2f} "
+                  f"(risk={self._risk_preference})")
+            return
+        # Per-entry ceiling: the configured cap, tightened by the risk profile.
+        band_hi = self._perp_max_position_usd
+        if equity > 0 and self._risk_max_pct > 0:
+            band_hi = min(band_hi, equity * self._risk_max_pct)
+        # ── Per-trade amount band (min_trade_usd … effective cap) ──
         # Clamp instead of reject — an entry below the configured floor is raised
         # to it and one above the cap is trimmed, matching the manual path.
         band_lo = max(self._perp_min_trade_usd, OKX_MIN_ORDER_USD)
-        band_hi = self._perp_max_position_usd
         if band_hi > 0 and stake_usd > band_hi:
             print(f"[DeskRunner] AUTO-EXEC SIZE {ticker}: ${stake_usd:.2f} capped to max ${band_hi:.2f}")
             stake_usd = band_hi

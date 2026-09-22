@@ -26,6 +26,32 @@ SYSTEM_UID = 0
 #: actually spends can never drift apart.
 DEFAULT_TRADE_USD = 50.0
 
+#: Default maximum holding time for one position — 12h, same as the system desk.
+DEFAULT_MAX_HOLD_SEC = 43200
+
+#: Used whenever a member never picked a preference.
+DEFAULT_RISK = "balanced"
+
+#: Risk preference → the numbers it REALLY drives. Before this existed the
+#: preference was stored and shown but never read by any order path.
+#:
+#:   max_pct   max notional for ONE entry, as a share of account equity
+#:   total_pct max total open exposure, as a share of account equity
+#:   k_sl / r  ATR multipliers for the adaptive stop / target
+#:   max_pos   max concurrent positions
+RISK_PROFILES: dict[str, dict[str, float]] = {
+    "conservative": {"max_pct": 0.02, "total_pct": 0.05, "k_sl": 1.2, "r": 3.5, "max_pos": 2},
+    "balanced":     {"max_pct": 0.04, "total_pct": 0.08, "k_sl": 1.5, "r": 3.0, "max_pos": 3},
+    "aggressive":   {"max_pct": 0.06, "total_pct": 0.12, "k_sl": 2.0, "r": 2.5, "max_pos": 5},
+}
+
+
+def risk_profile(pref) -> dict[str, float]:
+    """Driving numbers for a risk preference; unknown/empty → balanced."""
+    return RISK_PROFILES.get(
+        str(pref or DEFAULT_RISK).strip().lower(), RISK_PROFILES[DEFAULT_RISK]
+    )
+
 
 class TradeDB:
     """Thread-safe SQLite store for closed trades and open positions."""
@@ -549,6 +575,7 @@ class TradeDB:
                 min_trade_usd   REAL DEFAULT 10,
                 max_trade_usd   REAL DEFAULT 100,
                 trade_usd       REAL DEFAULT 50,
+                max_hold_sec    INTEGER DEFAULT 43200,
                 allowed_tickers TEXT DEFAULT '',
                 take_profit_pct REAL DEFAULT 3.0,
                 stop_loss_pct   REAL DEFAULT 1.5,
@@ -561,6 +588,8 @@ class TradeDB:
         self._ensure_column(conn, "user_settings", "max_trade_usd", "REAL DEFAULT 100")
         # Per-trade auto-execution notional (member-customisable, default $50).
         self._ensure_column(conn, "user_settings", "trade_usd", "REAL DEFAULT 50")
+        # Per-member maximum holding time (seconds) — powers the member time stop.
+        self._ensure_column(conn, "user_settings", "max_hold_sec", "INTEGER DEFAULT 43200")
         conn.commit()
         self._ensure_admin()
 
@@ -569,7 +598,7 @@ class TradeDB:
         "api_key", "api_secret", "api_passphrase",
         "risk_preference", "trade_mode", "run_start_time", "run_end_time",
         "max_position_usd", "min_trade_usd", "max_trade_usd", "trade_usd",
-        "allowed_tickers", "take_profit_pct", "stop_loss_pct",
+        "max_hold_sec", "allowed_tickers", "take_profit_pct", "stop_loss_pct",
     )
 
     #: Defaults applied when a member saves a partial payload.
@@ -579,6 +608,7 @@ class TradeDB:
         "run_start_time": "00:00", "run_end_time": "23:59",
         "max_position_usd": 100, "min_trade_usd": 10, "max_trade_usd": 100,
         "trade_usd": DEFAULT_TRADE_USD,
+        "max_hold_sec": DEFAULT_MAX_HOLD_SEC,
         "allowed_tickers": "", "take_profit_pct": 3.0, "stop_loss_pct": 1.5,
     }
 
@@ -817,7 +847,7 @@ class TradeDB:
                 "SELECT user_id, api_key, api_secret, api_passphrase,"
                 " risk_preference, trade_mode, run_start_time, run_end_time,"
                 " max_position_usd, min_trade_usd, max_trade_usd, trade_usd,"
-                " allowed_tickers, take_profit_pct, stop_loss_pct,"
+                " max_hold_sec, allowed_tickers, take_profit_pct, stop_loss_pct,"
                 " updated_at FROM user_settings WHERE user_id=?",
                 (user_id,),
             ).fetchone()
@@ -829,9 +859,9 @@ class TradeDB:
             "trade_mode": row[5], "run_start_time": row[6],
             "run_end_time": row[7], "max_position_usd": row[8],
             "min_trade_usd": row[9], "max_trade_usd": row[10],
-            "trade_usd": row[11],
-            "allowed_tickers": row[12], "take_profit_pct": row[13],
-            "stop_loss_pct": row[14], "updated_at": row[15],
+            "trade_usd": row[11], "max_hold_sec": row[12],
+            "allowed_tickers": row[13], "take_profit_pct": row[14],
+            "stop_loss_pct": row[15], "updated_at": row[16],
         }
 
     def get_users_with_api_keys(self) -> list[dict]:
@@ -846,7 +876,7 @@ class TradeDB:
                 """SELECT u.user_id, u.api_key, u.api_secret, u.api_passphrase,
                           u.risk_preference, u.trade_mode,
                           u.min_trade_usd, u.max_trade_usd, u.max_position_usd,
-                          u.trade_usd, u.take_profit_pct, u.stop_loss_pct
+                          u.trade_usd, u.max_hold_sec, u.take_profit_pct, u.stop_loss_pct
                    FROM user_settings u JOIN members m ON u.user_id = m.id
                    WHERE TRIM(COALESCE(u.api_key,'')) <> ''
                      AND TRIM(COALESCE(u.api_secret,'')) <> ''
@@ -854,7 +884,8 @@ class TradeDB:
             ).fetchall()
         keys = ("user_id", "api_key", "api_secret", "api_passphrase",
                 "risk_preference", "trade_mode", "min_trade_usd", "max_trade_usd",
-                "max_position_usd", "trade_usd", "take_profit_pct", "stop_loss_pct")
+                "max_position_usd", "trade_usd", "max_hold_sec",
+                "take_profit_pct", "stop_loss_pct")
         return [dict(zip(keys, r)) for r in rows]
 
     def upsert_user_settings(self, user_id: int, settings: dict) -> dict:

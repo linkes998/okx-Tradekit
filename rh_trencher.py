@@ -42,6 +42,14 @@ class TokenLaunch:
     _pairCreatedAt: int = 0       # DexScreener pairCreatedAt (epoch ms)
     _launch_price_usd: float = 0.0  # entry priceUsd for live multiple calc
     _pair_address: str = ""       # pairAddress (dedup key, alias for _pool_id)
+    # Real-market entry signal (OKX candles), set by rh_okx_data.evaluate_signal.
+    # When signal_mode == "real" this — not the narrative score — decides whether
+    # a real perpetual order is allowed.
+    signal_ok: bool = False
+    signal_reason: str = ""
+    signal_ts: float = 0.0
+    # 15m ATR% from evaluate_signal — drives ATR-adaptive SL/TP in DeskRunner.
+    atr_pct: float = 0.0
 
 
 @dataclass

@@ -30,8 +30,8 @@ from typing import Any
 from rh_trencher import Desk, TokenLaunch, scenario
 from rh_live_trader import LiveTrader, PendingSwap
 from rh_jupiter_executor import JupiterExecutor
-from db_trades import TradeDB, SYSTEM_UID
-from user_account import UserAccountManager
+from db_trades import TradeDB, SYSTEM_UID, DEFAULT_TRADE_USD
+from user_account import UserAccountManager, MemberTrader
 try:
     from rh_okx_executor import OKXExecutor, OKX_MIN_ORDER_USD
 except ImportError:
@@ -47,6 +47,9 @@ _runner: "DeskRunner | None" = None
 
 # ── Per-member OKX account contexts (own API key → own dashboard data) ──
 _account_mgr: UserAccountManager | None = None
+
+# ── Per-member auto trader (trades each member's OWN account by their rules) ──
+_member_trader: "MemberTrader | None" = None
 
 # ── Serialised /api/desk-state payload memo ───────────────────────
 # The desk state is rebuilt by the runner every tick but polled by every
@@ -1135,6 +1138,10 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
                   <input id="us-max-position" type="number" value="100" min="1" max="1000000" step="10" style="width:120px;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:3px;font-size:12px;font-family:var(--mono)">
                 </div>
                 <div>
+                  <label style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.1em;font-family:var(--mono);display:block;margin-bottom:6px" class="has-tip" data-tip="每笔自动交易开仓使用的买入金额（USD）。需介于单笔最小与最大金额之间；保存后立即对后续所有自动交易生效"><span data-i18n="trade_usd">Auto Trade Amount (USD)</span></label>
+                  <input id="us-trade-usd" type="number" value="50" min="1" max="1000000" step="1" style="width:130px;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:3px;font-size:12px;font-family:var(--mono)">
+                </div>
+                <div>
                   <label style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.1em;font-family:var(--mono);display:block;margin-bottom:6px"><span data-i18n="take_profit">Take Profit (%)</span></label>
                   <input id="us-take-profit" type="number" value="3.0" min="0.1" max="50" step="0.1" style="width:100px;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:3px;font-size:12px;font-family:var(--mono)">
                 </div>
@@ -1260,6 +1267,10 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:12
             <label style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em" data-i18n="pm_maxsize">Max Position Size (USD)</label>
             <input id="perp-max-size" type="number" value="25000" data-default="25000" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 10px;font-family:var(--mono);border-radius:2px;margin-top:4px;font-size:13px">
           </div>
+          <div>
+            <label style="font-size:10px;text-transform:uppercase;color:var(--text-dim);letter-spacing:.1em" data-i18n="pm_tradeusd">Auto Trade Amount (USD)</label>
+            <input id="perp-trade-usd" type="number" value="50" data-default="50" style="width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:8px 10px;font-family:var(--mono);border-radius:2px;margin-top:4px;font-size:13px">
+          </div>
           <div style="display:flex;align-items:center;gap:10px;padding:8px 0">
             <input id="perp-reopen" type="checkbox" checked data-default="true" style="width:16px;height:16px;cursor:pointer">
             <label style="font-size:12px;color:var(--text)" data-i18n="pm_reopen">Allow same-coin re-entry after close</label>
@@ -1365,6 +1376,7 @@ const I18N = {
     pm_sub:"Configure automatic position closing rules for perpetual futures",
     pm_tp:"Take Profit Threshold (%)", pm_sl:"Stop Loss Threshold (%)",
     pm_hold:"Max Hold Time (seconds)", pm_maxsize:"Max Position Size (USD)",
+    pm_tradeusd:"Auto Trade Amount (USD)",
     pm_reopen:"Allow same-coin re-entry after close",
     mr_ticker:"Ticker:", mr_side:"Side:", mr_usd:"USD:",
     // ── states / empty rows ──
@@ -1385,6 +1397,7 @@ const I18N = {
     feed:"Signal Feed", idle:"idle", running:"running", done:"done",
     noData:"No data", noOpen:"— no open positions —", noHistory:"— no closed trades yet —",
     min_trade_usd:"Min per Trade (USD)", max_position_usd:"Max per Trade (USD)",
+    trade_usd:"Auto Trade Amount (USD)",
     bandHint:"The per-trade amount band applies to OPENING orders only. One-click close and TP/SL exits are never blocked by it.",
     closePos:"Close", closeAll:"Close all", perTradeLimit:"Per-trade",
     submit:"Submit", submitted:"Submitted", failed:"Failed", pending:"Pending",
@@ -1529,6 +1542,7 @@ const I18N = {
     pm_sub:"配置永续合约持仓的自动平仓规则",
     pm_tp:"止盈阈值 (%)", pm_sl:"止损阈值 (%)",
     pm_hold:"最长持仓时间（秒）", pm_maxsize:"单笔最大仓位 (USD)",
+    pm_tradeusd:"每笔自动交易金额 (USD)",
     pm_reopen:"平仓后允许同一币种再次开仓",
     mr_ticker:"币种：", mr_side:"方向：", mr_usd:"金额：",
     // ── states / empty rows ──
@@ -1549,6 +1563,7 @@ const I18N = {
     feed:"信号流", idle:"待机", running:"运行中", done:"完成",
     noData:"无数据", noOpen:"— 暂无持仓 —", noHistory:"— 暂无历史交易 —",
     min_trade_usd:"单笔最小金额 (USD)", max_position_usd:"单笔最大金额 (USD)",
+    trade_usd:"每笔自动交易金额 (USD)",
     bandHint:"单笔金额区间只作用于「开仓」下单金额；一键平仓与止盈/止损平仓不受区间限制，确保任何仓位都能退出。",
     closePos:"平仓", closeAll:"全部平仓", perTradeLimit:"单笔限额",
     submit:"提交", submitted:"已提交", failed:"失败", pending:"待签名",
@@ -3783,6 +3798,7 @@ function openPerpSettings(){
     const setVal = (id,key)=>{const el=document.getElementById(id);if(el)el.value=s[key]||el.dataset.default||el.value;};
     setVal('perp-tp','tp_pct'); setVal('perp-sl','sl_pct');
     setVal('perp-max-hold','max_hold_sec'); setVal('perp-max-size','max_position_usd');
+    setVal('perp-trade-usd','trade_usd');
     setVal('perp-reopen','allow_reopen');
   });
 }
@@ -3796,6 +3812,7 @@ function savePerpSettings(){
     sl_pct: document.getElementById('perp-sl')?.value || '1',
     max_hold_sec: document.getElementById('perp-max-hold')?.value || '43200',
     max_position_usd: document.getElementById('perp-max-size')?.value || '25000',
+    trade_usd: document.getElementById('perp-trade-usd')?.value || '50',
     allow_reopen: document.getElementById('perp-reopen')?.checked ? 'true' : 'false',
   };
   fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({method:'save',settings:vals})})
@@ -4112,6 +4129,9 @@ async function loadUserSettings(){
     const minTrade = document.getElementById('us-min-trade');
     if(minTrade) minTrade.value = (_userSettingsCache.min_trade_usd !== undefined && _userSettingsCache.min_trade_usd !== null)
       ? _userSettingsCache.min_trade_usd : 10;
+    const tradeUsdEl = document.getElementById('us-trade-usd');
+    if(tradeUsdEl) tradeUsdEl.value = (_userSettingsCache.trade_usd !== undefined && _userSettingsCache.trade_usd !== null)
+      ? _userSettingsCache.trade_usd : 50;
     const tickers = document.getElementById('us-allowed-tickers');
     if(tickers) tickers.value = _userSettingsCache.allowed_tickers || '';
     _memberSelectedTickers = (_userSettingsCache.allowed_tickers || '').split(',').filter(t=>t.trim()).map(t=>t.trim().toUpperCase());
@@ -4178,17 +4198,29 @@ async function saveTradeSettings(){
   const unlimitedCheck = document.getElementById('us-time-unlimited');
   const maxPosInput = document.getElementById('us-max-position');
   const minTradeInput = document.getElementById('us-min-trade');
+  const tradeUsdInput = document.getElementById('us-trade-usd');
   const tickersInput = document.getElementById('us-allowed-tickers');
   const tpInput = document.getElementById('us-take-profit');
   const slInput = document.getElementById('us-stop-loss');
   const minTrade = parseFloat(minTradeInput?.value);
   const maxTrade = parseFloat(maxPosInput?.value);
+  const tradeUsd = parseFloat(tradeUsdInput?.value);
   if(isNaN(minTrade) || isNaN(maxTrade) || minTrade < 0 || maxTrade <= 0){
     alert(lang==='zh'?'请输入有效的单笔金额区间（最小/最大均需 ≥ 0）':'Enter a valid per-trade amount range (both ≥ 0)');
     return;
   }
   if(minTrade > maxTrade){
     alert(lang==='zh'?'单笔最小金额不能大于最大金额':'Min per-trade amount cannot exceed the max');
+    return;
+  }
+  if(isNaN(tradeUsd) || tradeUsd <= 0){
+    alert(lang==='zh'?'请输入有效的每笔自动交易金额（> 0）':'Enter a valid auto-trade amount (> 0)');
+    return;
+  }
+  if(tradeUsd < minTrade || tradeUsd > maxTrade){
+    alert(lang==='zh'
+      ? `每笔自动交易金额需在单笔最小 $${minTrade} 与最大 $${maxTrade} 之间`
+      : `Auto-trade amount must be between $${minTrade} and $${maxTrade}`);
     return;
   }
   const settings = {
@@ -4199,6 +4231,7 @@ async function saveTradeSettings(){
     min_trade_usd: minTrade,
     max_trade_usd: maxTrade,
     max_position_usd: maxTrade,
+    trade_usd: tradeUsd,
     allowed_tickers: (tickersInput?.value || '').trim(),
     take_profit_pct: parseFloat(tpInput?.value) || 3.0,
     stop_loss_pct: parseFloat(slInput?.value) || 1.5,
@@ -4208,8 +4241,8 @@ async function saveTradeSettings(){
     if(r.ok){
       _userSettingsCache = {..._userSettingsCache,...settings};
       showToast(lang==='zh'
-        ? `交易设置已保存 · 单笔 $${minTrade}–$${maxTrade}`
-        : `Trade settings saved · per-trade $${minTrade}–$${maxTrade}`);
+        ? `交易设置已保存 · 单笔 $${minTrade}–$${maxTrade} · 自动交易 $${tradeUsd}`
+        : `Trade settings saved · per-trade $${minTrade}–$${maxTrade} · auto $${tradeUsd}`);
     }else{
       alert(r.msg||r.error||'Save failed');
     }
@@ -5280,6 +5313,14 @@ class LiveHandler(BaseHTTPRequestHandler):
                 # The perp engine keys off max_position_usd — keep it aligned so
                 # the band is enforced on the live path too.
                 clean["max_position_usd"] = clean["max_trade_usd"]
+                # ── Per-trade auto-exec notional ──────────────────────────
+                # Clamped into the member's own band (and OKX's floor) so the
+                # saved value and what the executor actually spends can never
+                # conflict. Default $50 when the member never touched it.
+                clean["trade_usd"] = _num("trade_usd", DEFAULT_TRADE_USD,
+                                          OKX_MIN_ORDER_USD, clean["max_trade_usd"])
+                if clean["trade_usd"] < clean["min_trade_usd"]:
+                    clean["trade_usd"] = min(clean["min_trade_usd"], clean["max_trade_usd"])
                 clean["take_profit_pct"] = _num("take_profit_pct", 3.0, 0.1, 100)
                 clean["stop_loss_pct"] = _num("stop_loss_pct", 1.5, 0.1, 100)
             except ValueError as ve:
@@ -5289,6 +5330,14 @@ class LiveHandler(BaseHTTPRequestHandler):
 
             result = _runner.db.upsert_user_settings(info["user_id"], clean)
             result["settings"] = _runner.db.get_user_settings(info["user_id"])
+
+            # Make the just-saved per-trade amount effective immediately (the
+            # executor path reads the manager's cached settings row).
+            if _account_mgr is not None:
+                try:
+                    _account_mgr.cache_settings(info["user_id"], result["settings"])
+                except Exception:
+                    pass
 
             # Credentials supplied → warm this member's snapshot right away so
             # the dashboard switches over without waiting for the next cycle.
@@ -5516,6 +5565,28 @@ def main(host: str = "127.0.0.1", port: int = 8765, csv_path: str | None = None,
         _account_mgr.start()
         print(f"[LIVE_SERVER] member account contexts ON "
               f"(refresh={acct_refresh:.0f}s, demo={demo_flag})")
+
+        # ── Per-member auto trading ────────────────────────────────────
+        # Each member trades their OWN account using the settings saved in
+        # 会员中心 → 交易设置 (trade_usd / TP / SL / ticker filter / run window).
+        # Candidates reuse the shared desk's already-scored tokens, so this adds
+        # no extra candle requests.
+        global _member_trader
+        if os.environ.get("OKX_MEMBER_AUTO_TRADE", "1").lower() not in ("0", "false", "no"):
+            _member_trader = MemberTrader(
+                runner.db, _account_mgr,
+                default_trade_usd=DEFAULT_TRADE_USD,
+                candidates_fn=lambda: [
+                    {"ticker": t.ticker,
+                     "atr_pct": float(getattr(t, "atr_pct", 0.0) or 0.0),
+                     "reason": str(getattr(t, "signal_reason", ""))}
+                    for t in getattr(runner, "raw_tokens", [])
+                    if getattr(t, "signal_ok", False)
+                ],
+            )
+            _member_trader.start()
+        else:
+            print("[LIVE_SERVER] member auto-trading DISABLED (OKX_MEMBER_AUTO_TRADE=0)")
     else:
         print("[LIVE_SERVER] member account contexts OFF (no runner db)")
 
@@ -5527,6 +5598,8 @@ def main(host: str = "127.0.0.1", port: int = 8765, csv_path: str | None = None,
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n[LIVE_SERVER] stopping...")
+        if _member_trader is not None:
+            _member_trader.stop()
         if _account_mgr is not None:
             _account_mgr.stop()
         if runner:

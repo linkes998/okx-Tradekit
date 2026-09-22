@@ -55,12 +55,15 @@ class QuoteResult:
     side: str                    # "buy" or "sell"
     price_usd: float             # last price (USD per 1 base coin)
     size_usd: float              # input size in USD
-    size_base: float             # input size in base coin (e.g. BTC amount)
+    # SPOT: base coin amount (e.g. BTC). SWAP: CONTRACT count (张), which is
+    # what OKX expects in `sz` — NOT the base coin amount.
+    size_base: float
     out_amount_base: float      # estimated output (same as size_base for market, may differ on slippage)
     fee_amount_usd: float       # estimated OKX taker fee (0.08%)
     fee_bps: int                 # fee in basis points
     price_impact_pct: float      # estimated slippage (0 for market order, computed from depth if available)
     ticker: str = ""            # alias
+    ct_val: float = 1.0         # SWAP: base coins per contract (1.0 for SPOT)
 
 @dataclass
 class OKXOrder:
@@ -95,14 +98,8 @@ def _get_proxies() -> dict | None:
     return None
 
 
-# ── Connection reuse ─────────────────────────────────────────────────
-# Every call used to go through `requests.get/post`, opening a fresh
-# TCP+TLS connection each time. With one account snapshot per member every
-# 30s — three calls each — the TLS handshake dominated the cost. A pooled
-# Session keeps the connection alive and reuses it.
-#
-# The Session is thread-local because requests.Session is not fully
-# thread-safe and this module is called from several server threads.
+# A pooled, thread-local Session keeps TLS connections alive across calls.
+# requests.Session is not fully thread-safe, hence one session per thread.
 _SESSION_LOCAL = threading.local()
 
 
@@ -114,7 +111,7 @@ def _get_session() -> requests.Session:
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=8,
             pool_maxsize=16,
-            max_retries=0,          # retry policy lives in _post_with_backoff
+            max_retries=0,          # retry policy lives in _http_get / _post_with_backoff
             pool_block=False,
         )
         sess.mount("https://", adapter)
@@ -123,19 +120,35 @@ def _get_session() -> requests.Session:
     return sess
 
 
-def _http_get(url, params=None, headers=None, timeout=10.0):
+def _http_get(url, params=None, headers=None, timeout=10.0, max_retries=2):
+    """GET with exponential backoff for transient network/SSL errors.
+
+    Retries on connection/SSL/timeout errors (common behind Clash/Mihomo proxy).
+    HTTP 4xx responses fail fast (no retry) so auth/permission errors surface.
+    """
+    import time as _time
     proxies = _get_proxies()
     hdrs = {"Accept": "application/json", "User-Agent": "RH-OKX-Executor/1.0"}
     if headers:
         hdrs.update(headers)
-    try:
-        r = _get_session().get(url, params=params, headers=hdrs,
-                               proxies=proxies, timeout=timeout)
-        if r.status_code >= 400:
-            raise RuntimeError(f"HTTP {r.status_code} GET {url.split('?')[0]}: {r.text[:400]}")
-        return r.json()
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"HTTP GET {url.split('?')[0]} failed: {e}") from e
+    wait = 1.0
+    last_err = None
+    for attempt in range(max_retries + 1):
+        try:
+            r = _get_session().get(url, params=params, headers=hdrs, proxies=proxies, timeout=timeout)
+            if r.status_code >= 400:
+                # 4xx = deterministic error (auth/permission/404) — do not retry
+                raise RuntimeError(f"HTTP {r.status_code} GET {url.split('?')[0]}: {r.text[:400]}")
+            return r.json()
+        except requests.exceptions.RequestException as e:
+            msg = str(e).lower()
+            is_network = any(k in msg for k in ("ssl", "eof", "connect", "timeout", "reset", "refused", "unreachable"))
+            if not is_network:
+                raise RuntimeError(f"HTTP GET {url.split('?')[0]} failed: {e}") from e
+            last_err = e
+            _time.sleep(wait)
+            wait = min(wait * 2, 15.0)
+    raise RuntimeError(f"HTTP GET {url.split('?')[0]} failed after {max_retries+1} tries: {last_err}") from last_err
 
 
 def _http_post(url, payload, headers=None, timeout=15.0):
@@ -144,8 +157,7 @@ def _http_post(url, payload, headers=None, timeout=15.0):
     if headers:
         hdrs.update(headers)
     try:
-        r = _get_session().post(url, json=payload, headers=hdrs,
-                                proxies=proxies, timeout=timeout)
+        r = _get_session().post(url, json=payload, headers=hdrs, proxies=proxies, timeout=timeout)
         if r.status_code >= 400:
             raise RuntimeError(f"HTTP {r.status_code} POST {url}: {r.text[:500]}")
         return r.json()
@@ -234,6 +246,11 @@ class OKXExecutor:
 
         # lotSz cache: inst_id → minimum order size increment
         self._lot_sz_cache: dict[str, float] = {}
+        # ctVal cache: SWAP inst_id → base coins per contract (张)
+        self._ct_val_cache: dict[str, float] = {}
+        # instType → {instId: instrument dict} — avoids refetching the full
+        # instrument list once per ticker while pricing an order
+        self._inst_meta_cache: dict[str, dict] = {}
 
         # Account mode check (lazy)
         self._acct_type: str | None = None
@@ -273,23 +290,73 @@ class OKXExecutor:
         _, ok = self.check_account_mode()
         return ok
 
+    def _inst_meta(self, inst_type: str) -> dict:
+        """{instId: instrument dict} for an instType (cached; {} on failure)."""
+        if inst_type in self._inst_meta_cache:
+            return self._inst_meta_cache[inst_type]
+        try:
+            meta = {i.get("instId"): i for i in self.public_instruments(inst_type=inst_type)}
+        except Exception as e:
+            print(f"[OKXExecutor] instrument list fetch failed ({inst_type}): {e}")
+            return {}
+        if meta:
+            self._inst_meta_cache[inst_type] = meta
+        return meta
+
     def _get_lot_sz(self, inst_id: str) -> float:
-        """Get OKX lotSz for an instrument (cached). Returns 0 if unknown."""
+        """Get OKX lotSz for an instrument (cached). Returns 0 if unknown.
+
+        NOTE: lotSz for SWAP is expressed in CONTRACTS, for SPOT in base coins.
+        A failed lookup is deliberately NOT cached — caching a wrong lot size
+        (or a wrong ctVal) produces orders OKX rejects on every retry.
+        """
         if inst_id in self._lot_sz_cache:
             return self._lot_sz_cache[inst_id]
-        try:
-            inst_type = "SPOT" if "SPOT" in inst_id else "SWAP" if inst_id.endswith("-SWAP") else "SPOT"
-            insts = self.public_instruments(inst_type=inst_type)
-            for inst in insts:
-                if inst.get("instId") == inst_id:
-                    sz = float(inst.get("lotSz") or "1")
-                    self._lot_sz_cache[inst_id] = sz
-                    return sz
-        except Exception:
-            pass
-        # Default to 0.0001 if unknown (won't hurt since it's tiny)
-        self._lot_sz_cache[inst_id] = 0.0001
-        return 0.0001
+        inst_type = "SWAP" if inst_id.endswith("-SWAP") else "SPOT"
+        inst = self._inst_meta(inst_type).get(inst_id)
+        if inst:
+            sz = float(inst.get("lotSz") or "0")
+            if sz > 0:
+                self._lot_sz_cache[inst_id] = sz
+                return sz
+        return 0.0
+
+    def _get_ct_val(self, inst_id: str) -> float:
+        """Contract value: base coins per 1 contract (张), for SWAP only.
+
+        OKX SWAP `sz` is denominated in CONTRACTS, not base coins:
+          1 contract = ctVal base coins
+        Measured on OKX 2026-09-20: DOGE ctVal=1000, ADA ctVal=100, NEAR ctVal=10,
+        SOL/DOT/LINK/UNI/LTC ctVal=1. The values are fetched at runtime because
+        the earlier hardcoded guesses (DOT=10, ADA=1) were wrong.
+        SPOT instruments have no ctVal — return 1.0 so the conversion is a no-op.
+        """
+        if not inst_id.endswith("-SWAP"):
+            return 1.0
+        if inst_id in self._ct_val_cache:
+            return self._ct_val_cache[inst_id]
+        inst = self._inst_meta("SWAP").get(inst_id)
+        if inst:
+            val = float(inst.get("ctVal") or "1") or 1.0
+            self._ct_val_cache[inst_id] = val
+            return val
+        return 1.0
+
+    def _fmt_sz(self, value: float, inst_id: str) -> str:
+        """Format an order quantity using the instrument's lotSz precision.
+
+        Price-based formatting (the previous approach) produced e.g. "229.5"
+        for a DOGE SWAP that only accepts 0.1-contract increments, and could
+        also truncate a valid contract count to "0".
+        """
+        lot = self._get_lot_sz(inst_id)
+        decimals = 0
+        if lot and lot > 0:
+            txt = f"{lot:.10f}".rstrip("0")
+            decimals = len(txt.split(".")[1]) if "." in txt else 0
+        decimals = min(decimals, 8)
+        out = f"{value:.{decimals}f}"
+        return out if float(out) > 0 else ""
 
     @classmethod
     def from_env(cls):
@@ -572,20 +639,28 @@ class OKXExecutor:
         if exec_price <= 0:
             exec_price = last_price  # fallback
 
-        size_base = size_usd / exec_price
+        # ── USD notional → order quantity ──
+        # SPOT `sz` is base coin; SWAP `sz` is CONTRACTS (张), and
+        # 1 contract = ctVal base coins. Omitting the ctVal division sent
+        # DOGE-USDT-SWAP (ctVal=1000) a $20 order as 229 contracts ≈ $20,000
+        # notional, which OKX rejected with 51008 (insufficient margin).
+        ct_val = self._get_ct_val(inst_id)
+        size_base = size_usd / exec_price / ct_val
 
         # ── Align to lotSz (OKX requires order quantity be a multiple of lot size) ──
-        # Try to get lotSz from instrument metadata (cached)
         lot_sz = self._get_lot_sz(inst_id)
         if lot_sz and lot_sz > 0:
             # Round DOWN to nearest multiple of lotSz
             size_base = (size_base // lot_sz) * lot_sz
-            if size_base < lot_sz:
-                size_base = lot_sz  # minimum 1 lot
-            # Ensure enough USD notional
-            min_usd = size_base * exec_price
-            if min_usd < 5:  # skip absurdly small orders
-                size_base = 0
+            if size_base <= 0:
+                # Not even one lot fits the requested notional. Rounding UP to a
+                # whole lot would silently over-spend (a DOGE lot is 0.1 contract
+                # ≈ $9, a BTC lot is far worse), so only accept the single lot
+                # when it stays within ~2x of the requested size.
+                one_lot_usd = lot_sz * exec_price * ct_val
+                size_base = lot_sz if one_lot_usd <= size_usd * 2.0 else 0.0
+            if size_base > 0 and size_base * exec_price * ct_val < 5:
+                size_base = 0.0  # skip absurdly small orders
 
         out_amount = size_base
 
@@ -608,6 +683,7 @@ class OKXExecutor:
             fee_bps=self.default_fee_bps,
             price_impact_pct=price_impact,
             ticker=inst_id.split("-")[0],
+            ct_val=ct_val,
         )
 
     # ── Build order (server-side signed via API key) ────────────────
@@ -621,8 +697,10 @@ class OKXExecutor:
     ) -> OKXOrder:
         """Translate quote into a signed OKX order payload.
 
-        OKX V5 spot market orders use sz (base asset quantity) for BOTH
-        buy and sell — tdSz is NOT accepted for spot market orders.
+        OKX V5 market orders use sz for BOTH buy and sell (tdSz is not accepted
+        for spot market orders). sz is denominated in base coins for SPOT and in
+        CONTRACTS (张) for SWAP — get_quote() already applied the ctVal
+        conversion, so quote.size_base is in the unit OKX expects.
         """
         use_tag = tag or self.ai_builder_code or None
 
@@ -632,20 +710,15 @@ class OKXExecutor:
                 f"Order size ${quote.size_usd:.2f} below OKX minimum ${OKX_MIN_ORDER_USD:.0f} "
                 f"for {quote.inst_id}. Increase stake or skip."
             )
+        # size_base == 0 means the notional rounded below one lot — sending the
+        # legacy "0.0001" placeholder would open a bogus (or rejected) order.
+        if quote.size_base <= 0:
+            raise ValueError(
+                f"Order size ${quote.size_usd:.2f} rounds to zero quantity for "
+                f"{quote.inst_id} (ctVal={quote.ct_val}). Increase stake or skip."
+            )
 
-        # Use appropriate precision based on price level
-        price = quote.price_usd
-        if price >= 100:
-            sz = f"{quote.size_base:.6f}".rstrip("0").rstrip(".")
-        elif price >= 1:
-            sz = f"{quote.size_base:.4f}".rstrip("0").rstrip(".")
-        else:
-            # Low-price coins need more precision
-            sz = f"{quote.size_base:.2f}".rstrip("0").rstrip(".")
-            if sz in ("0", ".0"):
-                sz = f"{quote.size_base:.8f}".rstrip("0").rstrip(".")
-        if not sz or sz == "0":
-            sz = "0.0001"
+        sz = self._fmt_sz(quote.size_base, quote.inst_id)
 
         return OKXOrder(
             quote=quote, inst_id=quote.inst_id, side=quote.side,
@@ -768,8 +841,10 @@ class OKXExecutor:
             fee_ccy = f.get("ccy", "")
             side = f.get("side", "").upper()  # "buy"/"sell" → "BUY"/"SELL"
             ts_ms = int(f.get("fillTime", 0) or 0)
-            # Convert fill_sz to USD notional (best-effort)
-            notional_usd = round(fill_sz * fill_px, 4)
+            # Convert fill_sz to USD notional. SWAP fillSz is in CONTRACTS (张),
+            # so it must be scaled by ctVal; SPOT fillSz is already base coins.
+            ct_val = self._get_ct_val(inst_id) if inst_id else 1.0
+            notional_usd = round(fill_sz * ct_val * fill_px, 4)
             result.append({
                 "side": side,
                 "ticker": ticker,
@@ -785,11 +860,160 @@ class OKXExecutor:
         result.sort(key=lambda x: x["ts_ms"], reverse=True)
         return result[:limit]
 
+    def get_round_trips(self, limit: int = 50) -> list:
+        """Pair raw fills into realized round-trip trades (FIFO per instrument).
+
+        OKX /trade/fills returns one-sided executions. The Trade History page
+        needs a per-trade entry/exit/PnL view, so fills are netted FIFO: within
+        one instrument a BUY fill opens (or adds to) a long lot and a SELL fill
+        consumes it — and vice versa. Only matched quantity yields a record; the
+        unmatched remainder stays an open lot and is intentionally dropped (it
+        is already visible in the positions panel).
+
+        Returns newest-first dicts shaped for the dashboard's Trade History table.
+        """
+        fills = self.get_order_history(limit=max(limit * 4, 100))
+        chrono = list(reversed(fills))          # oldest first
+        books: dict[str, list[dict]] = {}       # inst_id → FIFO of open lots
+        out: list[dict] = []
+        for f in chrono:
+            inst = f.get("inst_id", "")
+            px = float(f.get("fill_px") or 0)
+            sz = float(f.get("fill_sz") or 0)
+            side = (f.get("side") or "").upper()
+            if not inst or px <= 0 or sz <= 0 or side not in ("BUY", "SELL"):
+                continue
+            # SWAP fillSz is in contracts (张) → scale by ctVal to get base coins
+            qty = sz * (self._get_ct_val(inst) if inst else 1.0)
+            if qty <= 0:
+                continue
+            fee = abs(float(f.get("fee") or 0))
+            ts = float(f.get("ts_ms") or 0) / 1000.0
+            book = books.setdefault(inst, [])
+
+            remaining = qty
+            while remaining > 1e-12 and book and book[0]["dir"] != side:
+                lot = book[0]
+                matched = min(remaining, lot["qty"])
+                entry_usd = lot["px"] * matched
+                exit_usd = px * matched
+                # Long lot closed by a SELL gains when price rose; short lot
+                # closed by a BUY gains when price fell.
+                sign = 1.0 if lot["dir"] == "BUY" else -1.0
+                entry_fee = lot["fee"] * (matched / lot["qty"]) if lot["qty"] else 0.0
+                exit_fee = fee * (matched / qty) if qty else 0.0
+                pnl = (px - lot["px"]) * matched * sign - entry_fee - exit_fee
+
+                out.append({
+                    "id": len(out) + 1,
+                    "ticker": f.get("ticker") or inst.split("-")[0],
+                    "side": "LONG" if lot["dir"] == "BUY" else "SHORT",
+                    "entry_usd": round(entry_usd, 2),
+                    "exit_usd": round(exit_usd, 2),
+                    "pnl_usd": round(pnl, 4),
+                    # Equity multiple, matching how the table renders "1.06x (+6.0%)"
+                    "pnl_mult": round(1 + pnl / entry_usd, 4) if entry_usd > 0 else 1.0,
+                    "win": pnl > 0,
+                    "entry_ts": lot["ts"],
+                    "exit_ts": ts,
+                    "fee_usd": round(entry_fee + exit_fee, 4),
+                    "why": ("swap " if "-SWAP" in inst else "spot ") + (
+                        "TP/SL" if pnl > 0 else "close"),
+                    "platform": "OKX",
+                })
+
+                lot["qty"] -= matched
+                lot["fee"] -= entry_fee
+                if lot["qty"] <= 1e-12:
+                    book.pop(0)
+                remaining -= matched
+
+            if remaining > 1e-12:
+                # Book is single-direction after the close loop above, so either
+                # merge into the same-side lot (weighted average entry) or open one.
+                if book and book[0]["dir"] == side:
+                    lot = book[0]
+                    total = lot["qty"] + remaining
+                    lot["px"] = (lot["px"] * lot["qty"] + px * remaining) / total
+                    lot["qty"] = total
+                    lot["fee"] += fee * (remaining / qty) if qty else 0.0
+                else:
+                    book.append({"dir": side, "px": px, "qty": remaining,
+                                 "fee": fee * (remaining / qty) if qty else 0.0,
+                                 "ts": ts})
+
+        out.sort(key=lambda x: x["exit_ts"], reverse=True)
+        return out[:limit]
+
     def submit_market(self, inst_id: str, side: str, size_usd: float, cl_ord_id: str | None = None, td_mode: str = "cross") -> dict:
-        """One-shot: quote → build → submit. Convenience for LiveTrader."""
+        """One-shot: quote → build → submit. Convenience for LiveTrader.
+
+        Use `close_swap` for closing existing SWAP positions — it takes the
+        position size (base coin quantity) and side=opposite, NOT a USD amount.
+        """
         quote = self.get_quote(inst_id, side, size_usd)
         order = self.build_order(quote, cl_ord_id=cl_ord_id, td_mode=td_mode)
         return self.submit_order(order)
+
+    def close_swap(self, inst_id: str, side: str, pos_qty: float,
+                   cl_ord_id: str | None = None, pos_side: str | None = None,
+                   td_mode: str = "cross") -> dict:
+        """Close an existing SWAP position by quantity (NOT USD amount).
+
+        Args:
+            inst_id:   e.g. "AAVE-USDT-SWAP"
+            side:      "buy" to close a SHORT, "sell" to close a LONG
+            pos_qty:   base coin quantity to close (|pos| from /account/positions)
+            cl_ord_id: client order ID
+            pos_side:  "long" / "short" — required when account is in hedge mode
+            td_mode:   "cross" (default) or "isolated"
+
+        Sends base-coin quantity + opposite `side` (never tdSz / quote notional,
+        which OKX treats as a NEW open order → 51008 when margin is short):
+          - net_mode        → `sz` + reduceOnly=true
+          - long_short_mode → `pos` + posSide
+        """
+        if not self._auth_ready:
+            raise RuntimeError("OKX API credentials not configured")
+        if abs(pos_qty) < 1e-12:
+            return {"ok": False, "msg": "pos_qty must be non-zero"}
+        # Strip float noise (e.g. 1.0600000000000001) — OKX rejects malformed sizes
+        qty = f"{abs(pos_qty):.10f}".rstrip("0").rstrip(".") or "0"
+        payload = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+            "side": side,
+            "ordType": "market",
+        }
+        if pos_side in ("long", "short"):
+            # Hedge mode (long_short_mode): `pos` names the position to reduce
+            payload["posSide"] = pos_side
+            payload["pos"] = qty
+        else:
+            # Net mode (net_mode): `pos` is rejected (51000 Parameter sz error);
+            # close with `sz` + reduceOnly so it can never open a new position
+            payload["sz"] = qty
+            payload["reduceOnly"] = "true"
+        if cl_ord_id:
+            # OKX clOrdId: alphanumeric ONLY (1-32 chars). Underscores/hyphens
+            # are rejected with 51000 "Parameter clOrdId error".
+            clean = "".join(c for c in cl_ord_id if c.isalnum())
+            if clean:
+                payload["clOrdId"] = clean[:32]
+        resp = self._signed_post(OKX_V5 + "/trade/order", payload)
+        result = self._check_ok(resp, "close_swap")
+        # Same return contract as submit_order — _check_ok returns the raw
+        # {"sCode":"0",...} dict which has NO "ok" key, so callers checking
+        # result.get("ok") would misread every successful close as a failure.
+        return {
+            "ok": True,
+            "order_id": result.get("ordId", ""),
+            "cl_ord_id": result.get("clOrdId", ""),
+            "inst_id": inst_id,
+            "side": side,
+            "sz": qty,
+            "msg": result.get("sMsg", ""),
+        }
 
     def set_leverage(self, inst_id: str, leverage: int, mgn_mode: str = "cross", pos_side: str | None = None) -> dict:
         """POST /api/v5/account/set-leverage — set leverage for a SWAP contract.

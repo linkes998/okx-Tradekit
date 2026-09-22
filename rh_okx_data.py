@@ -13,10 +13,140 @@ Usage:
 """
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
 from rh_trencher import TokenLaunch
+
+
+# ── Real-market entry signal ─────────────────────────────────────────
+# The legacy path fabricated `true_multiple_path` from hardcoded volatility
+# buckets (meme → 5x, blue chip → 1.18x), so every ticker "launched" on every
+# replay no matter what the market was doing, and the paper ledger filled up
+# with trades that never existed on OKX. The signal below is computed from real
+# OKX candles instead, and drives real perpetual entries.
+SIGNAL_BAR = os.environ.get("OKX_SIGNAL_BAR", "15m")
+SIGNAL_CANDLES = int(os.environ.get("OKX_SIGNAL_CANDLES", "100"))
+# Realized window replayed by the paper desk (real past closes, not a forecast)
+SIGNAL_PATH_BARS = int(os.environ.get("OKX_SIGNAL_PATH_BARS", "8"))
+
+
+def _f(x, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
+
+def _sma(vals: list[float], n: int) -> float:
+    return sum(vals[-n:]) / n if len(vals) >= n else 0.0
+
+
+def _rsi(closes: list[float], n: int = 14) -> float:
+    """Wilder RSI over chronological closes. 50.0 when there is not enough data."""
+    if len(closes) < n + 1:
+        return 50.0
+    gain = loss = 0.0
+    for i in range(1, n + 1):
+        d = closes[i] - closes[i - 1]
+        gain += max(d, 0.0)
+        loss += max(-d, 0.0)
+    gain /= n
+    loss /= n
+    for i in range(n + 1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gain = (gain * (n - 1) + max(d, 0.0)) / n
+        loss = (loss * (n - 1) + max(-d, 0.0)) / n
+    if loss <= 0:
+        return 100.0
+    rs = gain / loss
+    return 100.0 - 100.0 / (1.0 + rs)
+
+
+def _atr_pct(highs: list[float], lows: list[float], closes: list[float], n: int = 14) -> float:
+    """ATR as a percentage of the last close — the position's natural noise scale."""
+    if len(closes) < n + 1:
+        return 0.0
+    trs = []
+    for i in range(1, len(closes)):
+        trs.append(max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        ))
+    last = closes[-1]
+    return (sum(trs[-n:]) / n) / last * 100 if last > 0 else 0.0
+
+
+def evaluate_signal(candles: list, cfg: dict | None = None) -> dict:
+    """Score the REAL OKX candles and return an entry decision.
+
+    Rule (deliberately simple and explainable):
+      trend  : close > SMA20
+      RSI    : within [rsi_min, rsi_max]  (not oversold-broken, not blow-off)
+      vol    : ATR% within [atr_min, atr_max]  (enough movement, not chaos)
+      trigger: 20-bar breakout OR 10-bar ROC >= roc_min
+
+    Returns {"ok", "reason", "close", "rsi", "sma20", "atr_pct", "path"}.
+    `path` is the REALIZED multiple series of the last `path_bars` closes — the
+    paper desk replays it, so the ledger reflects real prices, not a forecast.
+    """
+    cfg = cfg or {}
+    rsi_min = cfg.get("rsi_min", _f(os.environ.get("OKX_SIGNAL_RSI_MIN"), 40.0))
+    rsi_max = cfg.get("rsi_max", _f(os.environ.get("OKX_SIGNAL_RSI_MAX"), 72.0))
+    atr_min = cfg.get("atr_min", _f(os.environ.get("OKX_SIGNAL_ATR_MIN"), 0.15))
+    atr_max = cfg.get("atr_max", _f(os.environ.get("OKX_SIGNAL_ATR_MAX"), 8.0))
+    roc_min = cfg.get("roc_min", _f(os.environ.get("OKX_SIGNAL_ROC_MIN"), 1.0))
+
+    # OKX returns candles newest-first; indicators need chronological order.
+    rows = sorted(candles, key=lambda c: int(c[0])) if candles else []
+    if len(rows) < 30:
+        return {"ok": False, "reason": f"insufficient candles ({len(rows)})", "path": []}
+
+    closes = [_f(r[4]) for r in rows]
+    highs = [_f(r[2]) for r in rows]
+    lows = [_f(r[3]) for r in rows]
+    last = closes[-1]
+    if last <= 0:
+        return {"ok": False, "reason": "bad last close", "path": []}
+
+    sma20 = _sma(closes, 20)
+    rsi = _rsi(closes, 14)
+    atr = _atr_pct(highs, lows, closes, 14)
+    prior_high = max(highs[-21:-1])
+    roc10 = (last / closes[-11] - 1) * 100 if len(closes) >= 11 and closes[-11] > 0 else 0.0
+
+    breakout = last >= prior_high
+    trend = last > sma20
+    rsi_ok = rsi_min <= rsi <= rsi_max
+    vol_ok = atr_min <= atr <= atr_max
+    trigger = breakout or roc10 >= roc_min
+    ok = trend and rsi_ok and vol_ok and trigger
+
+    trigger_txt = f"BREAKOUT>={prior_high:.6g}" if breakout else f"ROC10={roc10:+.2f}%"
+    reason = (f"{'PASS' if ok else 'SKIP'} close={last:.6g} SMA20={sma20:.6g} "
+              f"RSI={rsi:.1f} ATR%={atr:.2f} {trigger_txt}"
+              f"{'' if trend else ' [below SMA20]'}{'' if rsi_ok else ' [RSI out]'}"
+              f"{'' if vol_ok else ' [ATR out]'}")
+
+    base = closes[-1 - SIGNAL_PATH_BARS] if len(closes) > SIGNAL_PATH_BARS else closes[0]
+    path = [round(c / base, 4) for c in closes[-SIGNAL_PATH_BARS:]] if base > 0 else []
+
+    return {
+        "ok": ok, "reason": reason, "close": last, "rsi": round(rsi, 2),
+        "sma20": round(sma20, 8), "atr_pct": round(atr, 3),
+        "breakout": breakout, "roc10": round(roc10, 3), "path": path,
+    }
+
+
+def fetch_signal(executor, inst_id: str, cfg: dict | None = None) -> dict:
+    """Fetch candles for inst_id and evaluate the entry signal."""
+    try:
+        candles = executor.public_candles(inst_id, bar=SIGNAL_BAR, limit=SIGNAL_CANDLES)
+    except Exception as e:
+        return {"ok": False, "reason": f"candle fetch failed: {e}", "path": []}
+    return evaluate_signal(candles, cfg)
 
 
 # ── Theme mapping for OKX tickers ────────────────────────────────────
@@ -56,56 +186,27 @@ DEMO_COMPATIBLE_TICKERS: set[str] = {
 }
 
 
-def _inst_to_tokenlaunch(inst: dict, t_min: int, idx: int) -> TokenLaunch:
+def _inst_to_tokenlaunch(inst: dict, t_min: int, idx: int, signal: dict | None = None) -> TokenLaunch:
     """Convert an OKX instrument dict to a TokenLaunch for Desk.
 
-    OKX provides real price/volume data; we synthesize entry/exit paths
-    based on realistic volatility patterns for the asset class.
+    `signal` is the real-candle evaluation from evaluate_signal(); its realized
+    multiple path replaces the old fabricated per-theme volatility buckets.
     """
+    signal = signal or {}
     inst_id = inst.get("instId") or inst.get("inst_id", "")
     base_ccy = inst_id.split("-")[0] if "-" in inst_id else inst_id
     ticker = base_ccy.upper()
 
-    # Get current price and 24h change for path generation
-    last_price = float(inst.get("last") or 0)
-    open24h = float(inst.get("open24h") or last_price)
-    change_pct = float(inst.get("change_pct") or 0)
+    change_pct = _f(inst.get("change_pct"))
 
-    # Determine theme from coin mapping
     theme = COIN_THEMES.get(ticker, DEFAULT_THEME)
 
-    # Generate realistic multiple path based on coin type and volatility
-    # Major coins (BTC, ETH, SOL): moderate volatility
-    # Altcoins: higher volatility
-    # Meme coins: extreme volatility
-    if ticker in ("BTC", "ETH"):
-        # Blue chips: small moves, realistic for demo
-        path_mults = [1.02, 1.05, 1.08, 1.12, 1.18]
-    elif ticker in ("SOL", "BNB", "XRP"):
-        # Major alts: moderate volatility
-        path_mults = [1.05, 1.12, 1.22, 1.35, 1.55]
-    elif theme == "animal":
-        # Meme coins: high volatility
-        path_mults = [1.10, 1.25, 1.50, 2.0, 3.0, 5.0]
-    elif theme == "hood":
-        # DeFi/finance: steady growth
-        path_mults = [1.03, 1.08, 1.15, 1.25, 1.40]
-    elif theme == "ai-craze":
-        # AI coins: speculative growth
-        path_mults = [1.08, 1.18, 1.35, 1.60, 2.2, 3.5]
-    else:
-        # Generic: moderate
-        path_mults = [1.04, 1.10, 1.18, 1.28, 1.42]
-
-    # Apply current trend bias (if 24h change is positive, shift path up)
-    if change_pct > 5:
-        path_mults = [m * (1 + change_pct / 200) for m in path_mults]
-    elif change_pct < -5:
-        path_mults = [m * (1 + change_pct / 200) for m in path_mults]
+    # Realized multiple path (real candles) — paper replay only. Empty when the
+    # signal could not be computed, in which case the desk opens nothing.
+    path_mults = list(signal.get("path") or [])
 
     # Convert to TokenLaunch fields
     # OKX major pairs have real deep liquidity — use realistic ETH-based estimates
-    vol_24h = float(inst.get("vol_24h") or 0)
     base_ccy = inst_id.split("-")[0].upper() if "-" in inst_id else inst_id
     if base_ccy in ("BTC", "ETH"):
         liquidity_eth = 500.0 + abs(change_pct) * 2.0  # deep blue-chip books
@@ -132,17 +233,22 @@ def _inst_to_tokenlaunch(inst: dict, t_min: int, idx: int) -> TokenLaunch:
         selling_linked=0,
         true_multiple_path=path_mults,
         theme_hint=theme,
+        signal_ok=bool(signal.get("ok")),
+        signal_reason=str(signal.get("reason", "")),
+        signal_ts=time.time(),
+        atr_pct=float(signal.get("atr_pct") or 0.0),
     )
 
 
 class OKXDataSource:
     """Fetch and serve OKX market data as TokenLaunch objects for Desk."""
 
-    def __init__(self, executor):
+    def __init__(self, executor, signal_cfg: dict | None = None):
         self.executor = executor
         self._cache: list[TokenLaunch] = []
         self._cache_ts: float = 0
         self._cache_ttl: float = 300.0  # 5 minute cache
+        self._signal_cfg: dict = signal_cfg or {}
 
     def fetch_tokens(self, top_n: int = 30, force_refresh: bool = False) -> list[TokenLaunch]:
         """Fetch top N USDT pairs from OKX and convert to TokenLaunch.
@@ -178,13 +284,17 @@ class OKXDataSource:
             if ticker not in DEMO_COMPATIBLE_TICKERS:
                 skipped += 1
                 continue
+            # Real-candle entry signal: trend/RSI/ATR/breakout on the SWAP chart
+            sig = fetch_signal(self.executor, f"{ticker}-USDT-SWAP", self._signal_cfg)
             t_min = now_min + len(tokens) * 3  # 3-minute spacing for simulation
-            token = _inst_to_tokenlaunch(pair, t_min, len(tokens))
+            token = _inst_to_tokenlaunch(pair, t_min, len(tokens), sig)
             tokens.append(token)
 
         print(f"[OKXData] Loaded {len(tokens)} demo-compatible tokens from OKX (skipped {skipped} non-demo coins)")
-        if tokens:
-            print(f"[OKXData] Available coins: {[t.ticker for t in tokens]}")
+        for t in tokens:
+            print(f"[OKXData] SIGNAL {t.ticker}: {'PASS' if t.signal_ok else 'SKIP'} — {t.signal_reason}")
+        passing = [t.ticker for t in tokens if t.signal_ok]
+        print(f"[OKXData] Signal summary: {len(passing)}/{len(tokens)} pass → {passing}")
 
         self._cache = tokens
         self._cache_ts = time.time()

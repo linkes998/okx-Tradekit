@@ -25,6 +25,7 @@ never be able to trap a member in a losing position.
 from __future__ import annotations
 
 import hashlib
+import os
 import threading
 import time
 from typing import Any
@@ -35,6 +36,11 @@ except ImportError:  # pragma: no cover - OKX is optional at import time
     OKXExecutor = None
     OKX_MIN_ORDER_USD = 10.0
     TD_MODE_SPOT = "cross"
+
+try:
+    from db_trades import DEFAULT_TRADE_USD
+except ImportError:  # pragma: no cover - keeps this module importable alone
+    DEFAULT_TRADE_USD = 50.0
 
 
 def _f(v: Any, default: float = 0.0) -> float:
@@ -312,6 +318,33 @@ class UserAccountManager:
         """Nudge the worker to refresh soon (non-blocking)."""
         self._wake.set()
 
+    def cache_settings(self, user_id: int, settings: dict) -> None:
+        """Push a freshly saved settings row into the cache so it applies now.
+
+        The worker re-reads every member's row at least every 10s; this makes a
+        just-saved per-trade amount effective immediately instead of waiting for
+        that cycle to come round.
+        """
+        if not settings:
+            return
+        with self._lock:
+            self._settings[int(user_id)] = dict(settings)
+
+    def any_executor(self):
+        """Any ready member executor — used for public market data only.
+
+        The signal scanner needs an executor to call the public candles
+        endpoint; it does not matter whose, since no credentials are involved.
+        Returns ``None`` when no member has connected yet, in which case the
+        scanner falls back to whatever the server already computed.
+        """
+        with self._lock:
+            for rec in self._executors.values():
+                exe = rec.get("exe")
+                if exe is not None:
+                    return exe
+        return None
+
     def force_refresh(self, user_id: int, settings: dict | None = None) -> dict | None:
         """Blocking refresh — used after a trade action so the UI updates now."""
         if settings is not None:
@@ -377,8 +410,8 @@ class UserAccountManager:
         return amt, ""
 
     @staticmethod
-    def amount_band(settings: dict | None) -> dict:
-        """Normalise min/max from a settings row, tolerating legacy rows."""
+    def _band_bounds(settings: dict | None) -> tuple[float, float]:
+        """The member's (min, max) entry band, tolerating legacy rows."""
         s = settings or {}
         lo = _f(s.get("min_trade_usd"), 0.0) or 0.0
         hi = _f(s.get("max_trade_usd"), 0.0) or 0.0
@@ -388,7 +421,39 @@ class UserAccountManager:
         lo = max(lo, 0.0)
         if lo > hi:
             lo = hi
+        return lo, hi
+
+    @classmethod
+    def resolve_trade_usd(cls, settings: dict | None,
+                          fallback: float | None = None) -> float:
+        """The one effective per-trade notional (USD) for an entry.
+
+        Single source of truth — the default value, the member's saved value in
+        会员中心 → 交易设置 and the amount actually sent to OKX all resolve here,
+        so they can never disagree:
+
+          1. the member's saved ``trade_usd``
+          2. ``fallback`` (ops/system default: DB ``settings`` or env)
+          3. :data:`DEFAULT_TRADE_USD` (50)
+
+        The result is clamped into the member's ``[min, max]`` band and floored
+        at OKX's own minimum, so it is safe to hand straight to the executor.
+        """
+        s = settings or {}
+        amt = _f(s.get("trade_usd"))
+        if amt <= 0:
+            amt = _f(fallback) if fallback else DEFAULT_TRADE_USD
+        lo, hi = cls._band_bounds(s)
+        amt = min(max(amt, lo), hi)
+        return max(amt, OKX_MIN_ORDER_USD)
+
+    @classmethod
+    def amount_band(cls, settings: dict | None) -> dict:
+        """Normalise the entry band + effective per-trade size for one member."""
+        s = settings or {}
+        lo, hi = cls._band_bounds(s)
         return {"min": round(lo, 2), "max": round(hi, 2),
+                "trade_usd": round(cls.resolve_trade_usd(s), 2),
                 "okx_floor": OKX_MIN_ORDER_USD}
 
     # ── one-click close ────────────────────────────────────────────────────
@@ -520,4 +585,368 @@ class UserAccountManager:
             "side": "sell", "size_usd": round(notional, 2),
             "order_id": result.get("order_id", ""),
             "msg": f"Closed spot {ticker} (sell {order.sz})",
+        }
+
+
+# ── per-member auto trader ────────────────────────────────────────────────────
+
+def in_run_window(start: str | None, end: str | None, now: float | None = None) -> bool:
+    """True when *now* falls inside ``[start, end]``; empty/invalid = 24h.
+
+    Handles windows that wrap past midnight (e.g. 22:00 → 06:00).
+    """
+    s = (start or "").strip()
+    e = (end or "").strip()
+    if not s or not e:
+        return True
+    try:
+        sh, sm = (int(x) for x in s.split(":")[:2])
+        eh, em = (int(x) for x in e.split(":")[:2])
+    except (TypeError, ValueError):
+        return True
+    cur = time.localtime(now if now is not None else time.time())
+    mins = cur.tm_hour * 60 + cur.tm_min
+    lo, hi = sh * 60 + sm, eh * 60 + em
+    if lo <= hi:
+        return lo <= mins <= hi
+    return mins >= lo or mins <= hi
+
+
+class MemberTrader:
+    """Auto-trades each opted-in member's OWN OKX account by their OWN rules.
+
+    Why this exists
+    ---------------
+    :class:`~rh_desk_runner.DeskRunner` auto-trades the *shared system* account
+    only. A member who brought their own API key expects their own account to
+    trade by their own rules — the very values 会员中心 → 交易设置 writes:
+
+      * ``trade_usd``            per-trade notional  (default $50)
+      * ``take_profit_pct`` / ``stop_loss_pct``      TP/SL thresholds
+      * ``allowed_tickers``      optional ticker filter
+      * ``run_start_time`` / ``run_end_time``        trading window (empty = 24h)
+      * ``trade_mode == "auto"``  master opt-in
+
+    Because the amount is read through :meth:`UserAccountManager.resolve_trade_usd`
+    the value a member saves is exactly the value executed — the default, the
+    saved value and the order can never disagree.
+
+    Safety gates (all opt-in, AND-ed)
+    ---------------------------------
+      * complete API credentials on file,
+      * ``trade_mode == "auto"``,
+      * inside the run window,
+      * ``OKX_MEMBER_AUTO_TRADE`` env not disabled,
+      * per-ticker entry cooldown, delisting blacklist, OKX minimum size,
+      * max concurrent positions cap.
+
+    The engine never touches the shared system account: every order goes through
+    :meth:`UserAccountManager.executor_for_user`.
+    """
+
+    def __init__(self, db, account_mgr, default_trade_usd: float | None = None,
+                 signal_cfg: dict | None = None, candidates_fn=None,
+                 interval: float | None = None):
+        self._db = db
+        self._mgr = account_mgr
+        self._default_trade_usd = _f(default_trade_usd) or DEFAULT_TRADE_USD
+        self._signal_cfg = signal_cfg or {}
+        # Optional callable -> [{"ticker","atr_pct","reason"}]; when wired to the
+        # shared desk it reuses tokens it already scored (no extra candle calls).
+        self._candidates_fn = candidates_fn
+
+        self._interval = float(interval if interval is not None
+                               else os.environ.get("OKX_MEMBER_TRADE_INTERVAL_SEC", "60"))
+        self._interval = max(10.0, self._interval)
+        self._max_positions = int(os.environ.get("OKX_MEMBER_MAX_POSITIONS", "3"))
+        self._entry_cooldown = float(os.environ.get("OKX_MEMBER_ENTRY_COOLDOWN_SEC", "300"))
+        self._close_cooldown = float(os.environ.get("OKX_MEMBER_CLOSE_COOLDOWN_SEC", "90"))
+        self._leverage = int(os.environ.get("OKX_PERP_LEVERAGE", "5"))
+        self._tickers = [t.strip().upper() for t in (
+            os.environ.get("OKX_MEMBER_TICKERS")
+            or "BTC,ETH,SOL,DOGE,ADA,LINK,UNI,NEAR,APT,LTC,DOT"
+        ).split(",") if t.strip()]
+
+        # (user_id, inst_id|ticker) keyed state
+        self._sl_tp: dict[tuple[int, str], tuple[float, float]] = {}
+        self._last_entry: dict[tuple[int, str], float] = {}
+        self._last_exit: dict[tuple[int, str], float] = {}
+        self._delisted: set[str] = set()
+        self._sig_cache: list[dict] = []
+        self._sig_ts: float = 0.0
+        self._sig_ttl: float = 120.0
+        self._cycles = 0
+        self._orders = 0
+
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    # ── lifecycle ──────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="member-trader", daemon=True)
+        self._thread.start()
+        print(f"[MemberTrader] started (interval={self._interval:.0f}s "
+              f"max_pos={self._max_positions} entry_cooldown={self._entry_cooldown:.0f}s "
+              f"leverage={self._leverage}x)")
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.wait(timeout=self._interval):
+            try:
+                self.cycle()
+            except Exception as e:
+                print(f"[MemberTrader] cycle error: {e}")
+                import traceback
+                traceback.print_exc()
+
+    # ── one cycle over every member ────────────────────────────────────────
+
+    def cycle(self) -> None:
+        try:
+            members = self._db.get_users_with_api_keys()
+        except Exception as e:
+            print(f"[MemberTrader] member scan failed: {e}")
+            return
+        self._cycles += 1
+        active = 0
+        for m in members or []:
+            try:
+                if self._trade_member(m):
+                    active += 1
+            except Exception as e:
+                print(f"[MemberTrader] member {m.get('user_id')} error: {e}")
+        if members:
+            print(f"[MemberTrader] cycle #{self._cycles}: {len(members)} member(s), "
+                  f"{active} auto-trading, {self._orders} order(s) since start")
+
+    def _trade_member(self, m: dict) -> bool:
+        uid = int(m.get("user_id") or 0)
+        if uid <= 0:
+            return False
+        exe = self._mgr.executor_for_user(uid, m)
+        if exe is None:
+            return False
+        try:
+            raw = exe.get_positions()
+        except Exception as e:
+            print(f"[MemberTrader] user {uid}: positions fetch failed: {e}")
+            return False
+
+        positions = self._normalize(raw)
+        self._manage_closes(uid, m, exe, positions)
+
+        # Master opt-in — anything other than "auto" means hands off.
+        if str(m.get("trade_mode") or "").lower() != "auto":
+            return False
+        if not in_run_window(m.get("run_start_time"), m.get("run_end_time")):
+            return False
+        held = {p["ticker"].upper() for p in positions}
+        self._scan_entries(uid, m, exe, held)
+        return True
+
+    # ── helpers ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _normalize(raw: list) -> list[dict]:
+        """OKX ``/account/positions`` rows → SWAP-only normalised dicts."""
+        out: list[dict] = []
+        for pos in raw or []:
+            inst_id = pos.get("instId", "")
+            if "-SWAP" not in inst_id:
+                continue
+            size = _f(pos.get("pos"))
+            if abs(size) < 1e-8:
+                continue
+            avg_px = _f(pos.get("avgPx"))
+            last_px = _f(pos.get("last")) or _f(pos.get("markPx")) or avg_px
+            out.append({
+                "inst_id": inst_id,
+                "ticker": inst_id.replace("-USDT-SWAP", ""),
+                "side": "LONG" if size > 0 else "SHORT",
+                "size": size,
+                "avg_px": avg_px,
+                "last_px": last_px,
+                "upl": round(_f(pos.get("upl")), 2),
+                "pos_side": pos.get("posSide", "net"),
+            })
+        return out
+
+    @staticmethod
+    def _default_sl_tp(settings: dict) -> tuple[float, float]:
+        """The member's own TP/SL from 会员中心 → 交易设置."""
+        sl = abs(_f(settings.get("stop_loss_pct"), 1.5)) or 1.5
+        tp = abs(_f(settings.get("take_profit_pct"), 3.0)) or 3.0
+        return max(0.1, sl), max(0.1, tp)
+
+    # ── exits ──────────────────────────────────────────────────────────────
+
+    def _manage_closes(self, uid: int, m: dict, exe, positions: list[dict]) -> None:
+        now = time.time()
+        changed = False
+        for p in positions:
+            avg_px, last_px = p["avg_px"], p["last_px"]
+            if avg_px <= 0 or last_px <= 0:
+                continue
+            key = (uid, p["ticker"])
+            if now - self._last_exit.get(key, 0.0) < self._close_cooldown:
+                continue
+            pct = ((last_px - avg_px) if p["side"] == "LONG"
+                   else (avg_px - last_px)) / avg_px * 100
+            sl, tp = self._sl_tp.get((uid, p["inst_id"])) or self._default_sl_tp(m)
+            reason = None
+            if pct >= tp:
+                reason = f"TAKE_PROFIT +{pct:.1f}% (TP {tp:.2f}%)"
+            elif pct <= -sl:
+                reason = f"STOP_LOSS {pct:.1f}% (SL {sl:.2f}%)"
+            if reason is None:
+                continue
+            qty = abs(p["size"])
+            if qty <= 0:
+                continue
+            close_side = "sell" if p["side"] == "LONG" else "buy"
+            pos_side = p["pos_side"] if p["pos_side"] in ("long", "short") else None
+            cl = f"mc{uid}{close_side}{p['ticker']}{int(now * 1000)}"
+            try:
+                if hasattr(exe, "close_swap"):
+                    res = exe.close_swap(p["inst_id"], close_side, qty,
+                                         cl_ord_id=cl, pos_side=pos_side)
+                else:  # pragma: no cover - older executor fallback
+                    res = exe.submit_market(p["inst_id"], close_side,
+                                            qty * last_px, cl_ord_id=cl)
+            except Exception as e:
+                print(f"[MemberTrader] user {uid} close {p['ticker']} failed: {e}")
+                self._last_exit[key] = now
+                continue
+            self._last_exit[key] = now
+            if res.get("ok"):
+                changed = True
+                self._orders += 1
+                self._sl_tp.pop((uid, p["inst_id"]), None)
+                print(f"[MemberTrader] user {uid} CLOSE {p['ticker']} {close_side} "
+                      f"({reason}) qty={qty:.6f} upl=${p['upl']:.2f} "
+                      f"order={res.get('order_id', '')}")
+            else:
+                print(f"[MemberTrader] user {uid} CLOSE FAILED {p['ticker']}: "
+                      f"{res.get('msg') or res}")
+
+        # Drop frozen thresholds for instruments the account no longer holds.
+        live = {(uid, p["inst_id"]) for p in positions}
+        for k in list(self._sl_tp.keys()):
+            if k[0] == uid and k not in live:
+                self._sl_tp.pop(k, None)
+        if changed:
+            try:
+                self._mgr.force_refresh(uid, m)
+            except Exception:
+                pass
+
+    # ── entries ────────────────────────────────────────────────────────────
+
+    def _scan_entries(self, uid: int, m: dict, exe, held: set[str]) -> None:
+        if len(held) >= self._max_positions:
+            return
+        allowed = {t.strip().upper() for t in
+                   str(m.get("allowed_tickers") or "").split(",") if t.strip()}
+        now = time.time()
+        # Same resolver the settings UI/user_account use — one source of truth.
+        size = UserAccountManager.resolve_trade_usd(m, fallback=self._default_trade_usd)
+        if size < OKX_MIN_ORDER_USD:
+            return
+        for sig in self._signals():
+            if len(held) >= self._max_positions:
+                break
+            ticker = str(sig.get("ticker") or "").upper()
+            if not ticker or ticker in held:
+                continue
+            if allowed and ticker not in allowed:
+                continue
+            key = (uid, ticker)
+            if now - self._last_entry.get(key, 0.0) < self._entry_cooldown:
+                continue
+            inst_id = f"{ticker}-USDT-SWAP"
+            if inst_id in self._delisted:
+                continue
+            self._last_entry[key] = now
+            try:
+                exe.set_leverage(inst_id, self._leverage, mgn_mode="cross")
+            except Exception as e:
+                msg = str(e)
+                if "51001" in msg or "51087" in msg:
+                    self._delisted.add(inst_id)
+                print(f"[MemberTrader] user {uid} set_leverage {inst_id}: {e}")
+                continue
+            cl = f"me{uid}{ticker}{int(now * 1000)}"
+            try:
+                res = exe.submit_market(inst_id, "buy", size,
+                                        cl_ord_id=cl, td_mode="cross")
+            except ValueError as e:
+                print(f"[MemberTrader] user {uid} SKIP {ticker}: {e}")
+                continue
+            except Exception as e:
+                msg = str(e)
+                if "51001" in msg or "51087" in msg:
+                    self._delisted.add(inst_id)
+                print(f"[MemberTrader] user {uid} ENTRY {ticker} failed: {e}")
+                continue
+            if not res.get("ok"):
+                print(f"[MemberTrader] user {uid} ENTRY {ticker} rejected: "
+                      f"{res.get('msg') or res}")
+                continue
+            sl, tp = self._default_sl_tp(m)
+            self._sl_tp[(uid, inst_id)] = (sl, tp)
+            held.add(ticker)
+            self._orders += 1
+            print(f"[MemberTrader] user {uid} ENTRY {ticker} ${size:.2f} @ {inst_id} "
+                  f"SL={sl:.2f}% TP={tp:.2f}% order={res.get('order_id', '')} "
+                  f"[{str(sig.get('reason', ''))[:60]}]")
+
+    # ── signal source ──────────────────────────────────────────────────────
+
+    def _signals(self) -> list[dict]:
+        """Entry candidates: shared-desk tokens when wired, else self-computed."""
+        if self._candidates_fn is not None:
+            try:
+                out = self._candidates_fn() or []
+                if out:
+                    return out
+            except Exception as e:
+                print(f"[MemberTrader] candidates_fn failed: {e}")
+        now = time.time()
+        if self._sig_cache and now - self._sig_ts < self._sig_ttl:
+            return self._sig_cache
+        from rh_okx_data import fetch_signal
+        exe = self._mgr.any_executor()
+        out: list[dict] = []
+        if exe is not None:
+            for t in self._tickers:
+                try:
+                    sig = fetch_signal(exe, f"{t}-USDT-SWAP", self._signal_cfg)
+                except Exception:
+                    continue
+                if sig.get("ok"):
+                    out.append({"ticker": t,
+                                "atr_pct": _f(sig.get("atr_pct")),
+                                "reason": str(sig.get("reason", ""))})
+        self._sig_cache = out
+        self._sig_ts = now
+        return out
+
+    # ── introspection ──────────────────────────────────────────────────────
+
+    def status(self) -> dict:
+        return {
+            "running": bool(self._thread and self._thread.is_alive()),
+            "interval_sec": self._interval,
+            "max_positions": self._max_positions,
+            "leverage": self._leverage,
+            "cycles": self._cycles,
+            "orders": self._orders,
+            "open_thresholds": len(self._sl_tp),
+            "delisted": sorted(self._delisted),
         }
